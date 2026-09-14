@@ -164,7 +164,7 @@ class MetalQueue(HWQueue):
     if not _is_input_addr(addr) and isinstance(fixed:=getattr(base.arg, "buffer", None), Buffer):
       self.bindings.append((self.count, idx, fixed, off))
     else: self.setup("setKernelBuffer:offset:atIndex:", resource, off, idx)
-    return resource
+    return addr
 
   def setup(self, sel:str, *args:UOp|int): self.setups.append(mtl_call(self.root, self.pool_ref(4 + self.count), sel, *args))
 
