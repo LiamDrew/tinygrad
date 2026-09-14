@@ -3,52 +3,28 @@
 import struct, hashlib, sys
 from tinygrad.runtime.support.agx import air
 
-# ---- register operand: rN (32-bit) -> (N<<2)|1 ; dst nibble in stores/movimm --
+from tinygrad.renderer.agx import dsl
+
 def reg(tok):
     assert tok[0]=='r'; return int(tok[1:])
-def reg_operand(n): return ((n<<2)|1)&0xff       # confirmed: r0=0x01,r1=0x05,r2=0x09
-
-# ---- E4M3 immediate (bits[7:1], bit0=32-bit width flag) ----------------------
-def e4m3(v):
-    if v==0: raise ValueError("0.0 not E4M3; use movimm")
-    neg=v<0; v=abs(v)
-    for e in range(-11,5):
-        for m in range(8):
-            if 2.0**e*(1+m/8.0)==v: return (((e+11)<<3|m)<<1)|1, neg
-    raise ValueError(f"{v} not E4M3-representable; use movimm")
-
-# ---- mov_imm full fp32 (confirmed b3/b7 per-bit; mid=low21<<3) ----------------
-def movimm_bytes(dst, f):
-    v=struct.unpack('<I',struct.pack('<f',f))[0]
-    b3=((v>>25)&0x7f)<<1
-    b7=((v>>21)&0x0f) | ((dst&0x0f)<<4)   # high nibble carries dst reg (r0=>0)
-    mid=(v&0x1FFFFF)<<3
-    return bytes([0x0c,0x80,0x02,b3, mid&0xff,(mid>>8)&0xff,(mid>>16)&0xff, b7])
-
-# ---- instruction encoders (confirmed) ----------------------------------------
-def i_load(dstreg, slot, first, more_follow):
-    # b1 = 0x10 on the first load; b2 = 0x54 if another load follows else 0x44 (scoreboard bit)
-    b1=0x10 if first else 0x00
-    b2=0x54 if more_follow else 0x44
-    dst=(dstreg*4)&0xff                       # load dst-register field = reg*4
-    return bytes([0x67,b1,b2,dst,slot,0x01,0x20,0x00])
-def i_wait(): return bytes([0x51,0x01,0x00,0x40,0x46,0x00])
+def i_load(dstreg, slot, first, more_follow): return dsl.LOAD.encode(first=int(first), more=int(more_follow), dst=dstreg, slot=slot)
+def i_wait(): return dsl.WAIT.encode()
 def i_fadd_imm(dst,a,imm):
-    b,neg=e4m3(imm); mod=0x1c if neg else 0x14
-    return bytes([0x09,b,mod,reg_operand(a),0x80,0xc0])
-def i_fadd_reg(dst,a,bb):
-    return bytes([0x09,reg_operand(bb),0x1c,reg_operand(a),0x00,0xc0])
+    b,neg=dsl.e4m3(imm)
+    return dsl.FADD.encode(srcb=b, mod=dsl.FADD_NEG if neg else dsl.FADD_ADD_IMM, srca=dsl.reg_operand(a), bmode=0x80)
+def i_fadd_reg(dst,a,bb): return dsl.FADD.encode(srcb=dsl.reg_operand(bb), mod=dsl.FADD_NEG, srca=dsl.reg_operand(a))
 def i_store(srcreg, slot, is_result):
-    src=0x54 if is_result else (0x56 if srcreg==0 else 0x54+srcreg*2)
-    return bytes([0xe7,0x00,src,0x00,slot,0x01,0x21,0x00])
+    src=dsl.STORE_RESULT if is_result else (0x56 if srcreg==0 else dsl.STORE_RESULT+srcreg*2)
+    return dsl.STORE.encode(src=src, slot=slot)
+def movimm_bytes(dst, f): return dsl.MOVIMM.encode(dst=dst, **dsl.movimm_fields(f))
 
 PREAMBLE_IDX = bytes.fromhex('030007000200000060000e000000')  # thread-index preamble
-EPILOGUE     = bytes.fromhex('1100009011000e000000')          # barrier + stop
+EPILOGUE     = dsl.BARRIER.encode() + dsl.STOP.encode()
 
 def assemble_text(program):
     """Return (text_bytes, N, written slots). Builds preamble(0..0x40) + main + epilogue."""
     N=0; main=bytearray(); load_i=0; written=set()
-    main+=bytes.fromhex('1ca01006')                       # thread-index prologue
+    main+=dsl.GET_TID.encode()                            # thread-index prologue
     lines=[l.split(';')[0].strip() for l in program.splitlines()]  # ';' comments only ('#'=imm)
     lines=[l for l in lines if l]
     body=[]
@@ -82,7 +58,7 @@ def assemble_text(program):
             raise ValueError(f"unknown op {op}")
     main+=EPILOGUE
     text=bytearray(PREAMBLE_IDX)
-    while len(text)<0x40: text+=b'\x06\x00'
+    while len(text)<0x40: text+=dsl.NOP.encode()
     text+=main
     return bytes(text), N, written
 

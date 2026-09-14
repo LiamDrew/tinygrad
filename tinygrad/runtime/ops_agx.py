@@ -10,6 +10,7 @@ import tinygrad.runtime.support.objc as objc
 from tinygrad.runtime.ops_metal import MetalDevice, MetalQueue, checked, to_ns_str
 from tinygrad.runtime.support.hcq2 import encode_submit
 from tinygrad.runtime.support.agx import asm
+from tinygrad.renderer.agx import dsl
 
 # step 1 stub: every kernel renders to the same three-buffer add, data0[t] = data1[t] + data2[t]
 ADD_ASM = """
@@ -25,6 +26,7 @@ store r2, 0
 class AGXCompiler(Compiler):
   def __init__(self): super().__init__("compile_agx")
   def compile(self, src:str) -> bytes: return asm.build(src)[0]
+  def disassemble(self, lib:bytes): print(dsl.disasm_str(text_section(split_archive(lib)[0])))
 
 class AGXRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
@@ -90,6 +92,20 @@ def split_archive(archive:bytes) -> tuple[bytes, bytes]:
           return s0[off:off + size], archive[mloff:mloff + mlsz]
     o += sz
   raise ValueError('no __compute section in slice0')
+
+def text_section(inner:bytes) -> bytes:
+  """__text of the compute object (an object Mach-O): the machine code"""
+  o = 32
+  for _ in range(struct.unpack('<I', inner[16:20])[0]):
+    cmd, sz = struct.unpack('<II', inner[o:o + 8])
+    if cmd == 0x19:
+      for i in range(struct.unpack('<I', inner[o + 64:o + 68])[0]):
+        sh = o + 72 + 80 * i
+        if inner[sh:sh + 6] == b'__text':
+          size, off = struct.unpack('<QI', inner[sh + 40:sh + 52])
+          return inner[off:off + size]
+    o += sz
+  raise ValueError('no __text section')
 
 # *****************
 # device
