@@ -188,6 +188,9 @@ TG_BARRIER = Inst("barrier", bytes.fromhex("070454610900"), doc="threadgroup_bar
 # layout). Three different register encodings in one instruction: dst byte 3 = register number, A byte 5 and B byte 6 = register << 1, C byte 7 =
 # register with each adjacent bit pair swapped (r4 -> 08, r6 -> 09, r8 -> 04, r20 -> 28; found by stepping the field against loaded candidates).
 # byte 11 bit 0 = accumulate C (alone it suffices); byte 9 bit 1 = C is a register (clear: the C byte reads as a small immediate, 08 -> +0.125).
+# A and B are 6-bit register numbers at bit 1 (r0..r63); bit 7 of each byte is live_a / live_b, which Apple sets while the fragment is still
+# needed by a later mma and clears on its last use (its winning matmul, scratch mm_metal_1024.dis: four mmas share one A fragment and only the
+# fourth has live_a clear). Decoding those bits as part of the register number printed r118 for r54.
 # byte 8 bit 7 and byte 9 bit 0 are set in Apple's code on last uses but did not zero A or B when tested; left as flags we never set. Apple's
 # kernels vary byte 1's high nibble / byte 2 bit 0 / byte 6 bit 0 for some register choices (undecoded; they are not C's high bits); r0..r46 verified.
 # C IS CONSUMED unless D = C: after `mma rD, rA, rB, rC` with D != C the pair rC read back as 0 for r14, r16, r20 (a later mma using it added
@@ -196,7 +199,7 @@ TG_BARRIER = Inst("barrier", bytes.fromhex("070454610900"), doc="threadgroup_bar
 # accumulators between two pairs (mm_tile16.metal: r15 -> r25 -> r15) rather than accumulating in place; both run at the same speed.
 def mma_c(reg:int) -> int: return ((reg & 0x55) << 1) | ((reg & 0xaa) >> 1)
 MMA = Inst("mma", bytes.fromhex("cf025400000000 00 54402400".replace(" ", "")), (
-  Field("wait", B(2, 1), 1), Field("dst", B(3), 8), Field("a", B(5, 1), 7), Field("b", B(6, 1), 7), Field("c", B(7), 8),
+  Field("wait", B(2, 1), 1), Field("dst", B(3), 8), Field("a", B(5, 1), 6), Field("live_a", B(5, 7), 1), Field("b", B(6, 1), 6), Field("live_b", B(6, 7), 1), Field("c", B(7), 8),
   Field("f8", B(8, 7), 1), Field("f9", B(9, 0), 1), Field("creg", B(9, 1), 1), Field("acc", B(11, 0), 1)),
   doc="dst, dst+1 = (a, a+1) * (b, b+1) [+ (c, c+1)] as 8x8 fragments across the SIMD group")
 def store_off_fields(off:int) -> dict[str, int]:

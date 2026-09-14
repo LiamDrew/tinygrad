@@ -32,6 +32,13 @@ Freezes and hangs are marked. Never emit an instruction whose fields you have no
 - Loads are asynchronous. The FIRST consumer of loaded data must be a waiting form: STORE byte 2 = 0x56, six-byte float ALU with tail 00 c0,
   or byte 2 bit 1 on the addr-family / convert / transcendental / mma forms. Non-waiting consumers read zeros. One waiting consumer covers all
   outstanding loads. Apple uses per-load scoreboard slots instead (consumer tails 20/40/60/80/a0 wait on one slot); undecoded, not needed so far.
+- A register with a load in flight is overwritten when that load lands, so a `movimm` into it is silently lost: `load r0,.. | movimm r0,#10 |
+  iadd r6,r0,r0` returns 2x the LOADED value, not 20. Putting any waiting instruction (`iadd` and friends always wait, byte 2 bit 1 is set in
+  their templates) before the `movimm` drains the queue and the write sticks. r0 is not special; any destination register behaves this way.
+- The same async landing blocks loop unrolling. Reusing fragment registers for a second K sub-step is WRONG on hardware even though the
+  instruction stream is correct: the second sub-step's loads land before the first sub-step's later `mma`s have read those registers. The error
+  pattern proves it - the fragment consumed by the first four mmas is mostly right, the fragments consumed by mmas 5-16 are entirely wrong.
+  Unrolling needs either disjoint fragment registers (we have only 16 free) or the scoreboard slots, which are not decoded.
 - Two stores back to back lose data without each store's tail (the old "store_wait"); the tail is now part of the store.
 - Issuing loads early and consuming later hides latency: the 256 matmul went 430 -> 99 us with a 24-register early-load budget; 131 us all-early.
 
@@ -96,6 +103,13 @@ Freezes and hangs are marked. Never emit an instruction whose fields you have no
   came from single runs and did not survive the measurement protocol below.
 - Switching a loop from an immediate count to a register count (same iteration count) took the 1024 unstaged kernel from 624 to 491 us,
   reproducibly. Unexplained; possibly the immediate form's `extra` bit path.
+
+## How much headroom is left in the matmul
+- `mm_direct` at N=2048 runs 3156 us. The identical kernel with every load and address instruction deleted runs 2936 us, and with the
+  accumulator chains collapsed to one, 2854 us. So the kernel is ~93% matrix-issue bound: perfect memory overlap is worth at most 7%, and
+  scoreboard slots and kill bits are bounded by that. The matrix unit sustains 16.78M mma instructions in 2936 us = 5.7e9 mma/s = 5.9 TFLOP/s.
+- Accumulator dependencies cost nothing: 16, 4 and 1 independent accumulator chains run 2935 / 2896 / 2854 us, i.e. fewer chains is marginally
+  FASTER. In-place accumulation has no latency penalty, so there is nothing to win from more chains or from ping-ponging accumulators.
 
 ## Method (what actually worked)
 - One field per probe, pairwise diffs against a known kernel, then a minimal GPU kernel with a double read.
