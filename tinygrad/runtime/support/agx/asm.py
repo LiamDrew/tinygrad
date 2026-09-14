@@ -6,6 +6,7 @@ from tinygrad.runtime.support.agx import air
 from tinygrad.renderer.agx import dsl
 
 MAXREG=[0] # highest register named while assembling, declared to the driver in the metadata
+TGMEM=[0]  # threadgroup memory bytes requested by .tgmem
 def reg(tok):
     assert tok[0]=='r'; MAXREG[0]=max(MAXREG[0], int(tok[1:])); return int(tok[1:])
 def i_load_idx(dstreg, slot, areg, first, more_follow, kill=False, count=1, off=0): # kill: areg dies here (dsl.KILL_MODEL); count consecutive dsts
@@ -20,11 +21,14 @@ def i_store_idx(srcreg, slot, areg, first=False, wait=False, last=False, kill=Fa
     return dsl.STORE.encode(first=int(first), wait=int(wait), src=srcreg, slot=slot, areg=areg, killa=int(kill), last=int(last), wcode=dsl.WCODE[count], s7=1, fmt=1,
                             **dsl.store_off_fields(off))
 def i_imul(dst, stride): return dsl.IMUL.encode(dst=dst, stride=stride)
-def loop_head(c, n, depth): # init and the increment/compare/enter block. between them the assembler puts the `pre` section (counter = 0..n-1)
-    assert n >= 2, "loop counts below 2 hang the GPU"
-    assert n <= 255, f"loop counts above 255 need a register-held count (not implemented), got {n}"
-    inc = dsl.LOOP_INC.encode(dst=c, step=1, src=c) + dsl.LOOP_CMP.encode(depth2=2 * depth, src=dsl.reg_operand(c), n=(n >> 1) & 0x3f, n_hi=n >> 7) + dsl.NOP.encode() + dsl.LOOP_ENTER.encode(extra=n & 1)
-    return dsl.LOOP_INIT.encode(dst=c), inc
+def loop_head(c, n, depth, nreg=None): # init and the increment/compare/enter block. between them the assembler puts the `pre` section (counter = 0..n-1)
+    if nreg is not None:   # count held in a register (any value; the compare is against the full 32 bits)
+        cmp = dsl.LOOP_CMP.encode(depth2=2 * depth, src=dsl.reg_operand(c), nreg=1, n=nreg) + dsl.NOP.encode() + dsl.LOOP_ENTER.encode(imm=0)
+    else:
+        assert n >= 2, "loop counts below 2 hang the GPU"
+        assert n <= 255, f"immediate loop counts stop at 255; use a register (loop rC, rN), got {n}"
+        cmp = dsl.LOOP_CMP.encode(depth2=2 * depth, src=dsl.reg_operand(c), n=((n >> 1) & 0x3f) | 0x40, n_hi=n >> 7) + dsl.NOP.encode() + dsl.LOOP_ENTER.encode(extra=n & 1, imm=1)
+    return dsl.LOOP_INIT.encode(dst=c), dsl.LOOP_INC.encode(dst=c, step=1, src=c) + cmp
 def loop_tail(back, depth): # back: bytes from the increment to here
     return dsl.LOOP_TAIL.encode(depth4=8 + depth) + dsl.BRANCH.encode(off=(-(back + dsl.LOOP_TAIL.size)) & 0xffffffffff) + dsl.LOOP_EXIT.encode()
 def i_falu_imm(dst,a,imm,mul=0,wait=True): # an immediate needs the six-byte form (byte4 bit7); tail c0 only when waiting for loads
@@ -60,6 +64,7 @@ def assemble_text(program):
         p=l.replace(',',' ').split()
         op=p[0]
         if op=='.buffers': N=int(p[1]); continue
+        if op=='.tgmem': TGMEM[0]=int(p[1]); continue         # threadgroup memory bytes (metadata field 28)
         body.append(p)
     total_loads=sum(1 for p in body if p[0].startswith('load')); last_store=max((i for i,p in enumerate(body) if p[0].startswith('store')), default=-1)
     for bi,p in enumerate(body):
@@ -108,13 +113,24 @@ def assemble_text(program):
         elif op.startswith('icmp.') or op.startswith('fcmp.'):   # icmp.lt|gt|ult|eq|ne / fcmp.lt|gt|le|eq|ne rD, rA, rB : rD = (rA op rB) ? 1 : 0
             code=op[5:] if op.startswith('icmp.') else 'f'+op[5:]
             main+=dsl.ICMP.encode(**dsl.dst_fields(reg(p[1])), srcb=dsl.reg_operand(reg(p[2])), srca=dsl.reg_operand(reg(p[3])), **dsl.cmp_fields(code)); pending=False
-        elif op=='loop':                                 # loop rC, #n [pre] body [post] endloop
-            init, inc = loop_head(reg(p[1]), int(p[2].lstrip('#')), len(loops))  # pre: ALU-only, sees rC = 0..n-1 (Apple's layout); post: the rest, rC = 1..n
+        elif op=='loop':                                 # loop rC, #n | loop rC, rN  [pre] body [post] endloop
+            if p[2].startswith('#'): init, inc = loop_head(reg(p[1]), int(p[2][1:]), len(loops))  # pre: ALU-only, sees rC = 0..n-1 (Apple's layout); post: the rest, rC = 1..n
+            else: init, inc = loop_head(reg(p[1]), 0, len(loops), nreg=reg(p[2]))
             main+=init; loops.append((len(main), inc)); pending=False # loop_init's tail waits for pending loads
         elif op=='body':
             main+=loops[-1][1]
         elif op=='endloop':
             start, _ = loops.pop(); main+=loop_tail(len(main) - start, len(loops))
+        elif op in ('tgload','tgload4','tgstore','tgstore4'):   # tgload[4] rD, rA [, #off] | tgstore[4] rS, rA [, #off] : threadgroup memory, element index in rA
+            inst = dsl.TG_LOAD if op.startswith('tgload') else dsl.TG_STORE
+            off = int(p[3].lstrip('#')) if len(p) > 3 else 0; n = 4 if op.endswith('4') else 1
+            assert N and TGMEM[0], "threadgroup ops need .buffers and .tgmem first"
+            kw = dict(base=2 * tg_base_words(N), a=reg(p[2]), w4=3 if n == 4 else 0, wait=int(pending), **(dict(off0=off & 1, off1=off >> 1) if inst is dsl.TG_LOAD else dsl.store_off_fields(off)))   # base: uniform register (16-bit units) holding the tg pointer
+            main += inst.encode(dst=reg(p[1]), **kw) if inst is dsl.TG_LOAD else inst.encode(src=reg(p[1]), **kw)
+            for k in range(1, n): reg(f"r{reg(p[1])+k}")
+            pending = inst is dsl.TG_LOAD; seen_mem = True
+        elif op=='barrier':
+            main+=dsl.TG_BARRIER.encode()
         elif op=='wait':                                 # accepted for old kernel text: the wait word is part of LOAD now (dsl.LOAD_WAIT_MODEL)
             pass
         elif op=='raw':                                  # raw <hex bytes>: an instruction under investigation (experiments only)
@@ -177,17 +193,21 @@ def flatbuffer(objs, root):
         out[base:base + len(body)] = body
     return bytes(out)
 
-def gen_metadata(N, written=None, nregs=2):
+def tg_base_words(N): return 2 * N + (2 if N % 2 else 0)   # uniform words holding the buffer addresses (+ pad); the threadgroup base follows
+def gen_metadata(N, written=None, nregs=2, tgmem=0):
     """Metadata for N buffers with an explicit written set (default {N-1}). Every object here is dereferenced by the
     AGX driver (ProgramBindingRemap segfaults without it); hardware-verified N=1..3.
     nregs: fn.f0, the register count Apple's compiler writes (2 for an r0-only kernel, 10 for r7, 30 for r23). It was missing
     here, which the hardware tolerated up to about r14; a kernel touching r24 with it unset froze the machine (2026-09-14)."""
     written = {N - 1} if written is None else written
     spans = [dict(f0=3, f2=2 * N)] + ([dict(f0=6, f2=2, f3=2 * N)] if N % 2 else [])   # uniform-register spans: 2N address words + pad to 4
+    words = tg_base_words(N)
+    if tgmem: spans.append(dict(f0=6, f2=4, f3=words))   # threadgroup memory base pointer in uniform words [words, words+4) (probes/tg: {6, 4, 4} for N=2)
     o = {'root':   ('tbl', {0: ('ref', 'fn'), 3: ('ref', 'nameh')}),
-         'nameh':  ('tbl', {1: ('ref', 'name')}),  'name': ('str', 'agc.main'),
-         'fn':     ('tbl', {0: ('u32', nregs), 1: ('u32', 4), 2: ('ref', 'spans'), 3: ('u32', 8 * N), 4: ('ref', 'descs'), 13: ('ref', 'zeros'),
-                            26: ('ref', 'cpoolv'), **({32: ('u8', 1)} if nregs > 10 else {}), **{s: ('ref', 'empty') for s in (6, 8, 10, 12, 27)}}),
+         'nameh':  ('tbl', {1: ('ref', 'name'), **({2: ('u32', tgmem // 4)} if tgmem else {})}),  'name': ('str', 'agc.main'),   # 2: threadgroup words; the load-bearing field (probes/tg)
+         'fn':     ('tbl', {0: ('u32', nregs), 1: ('u32', words + 4 if tgmem else 4), 2: ('ref', 'spans'), 3: ('u32', 8 * N), 4: ('ref', 'descs'), 13: ('ref', 'zeros'),
+                            26: ('ref', 'cpoolv'), **({32: ('u8', 1)} if nregs > 10 else {}), **({28: ('u32', tgmem), 18: ('u32', 0x03010101)} if tgmem else {}),   # 28: threadgroup bytes; 18: appears with threadgroup memory (probes/tg)
+                            **{s: ('ref', 'empty') for s in (6, 8, 10, 12, 27)}}),
          'cpoolv': ('vec', ['cpool']),
          'cpool':  ('tbl', {0: ('ref', 'cpools'), 1: ('u8', 3), 2: ('u8', 1), 3: ('u32', 16)}),  'cpools': ('str', 'agc.main.constant_program'),
          'zeros':  ('raw', struct.pack('<I', 8 * N) + bytes(8 * N)),
@@ -310,9 +330,9 @@ def build_archive(new_text, new_md, N):
 
 def build(program):
     """Assemble `program` and return (archive_bytes, N)."""
-    MAXREG[0]=0
+    MAXREG[0]=0; TGMEM[0]=0
     text,N,written=assemble_text(program)
-    md=gen_metadata(N, written, nregs=min(128, (MAXREG[0] + 9) // 8 * 8 + 8))   # Apple writes max_reg+1..+7 (r7 -> 10, r23 -> 30, r47 -> 50); the count sets occupancy (2x over-declaring cost 2x on matmul). One extra 8-block of margin
+    md=gen_metadata(N, written, nregs=min(128, (MAXREG[0] + 9) // 8 * 8 + 8), tgmem=TGMEM[0])   # Apple writes max_reg+1..+7 (r7 -> 10, r23 -> 30, r47 -> 50); the count sets occupancy (2x over-declaring cost 2x on matmul). One extra 8-block of margin
     return build_archive(text, md, N), N
 
 if __name__=='__main__':

@@ -409,7 +409,7 @@ class TestAGX(unittest.TestCase):
         self.assertEqual(got[8 - len(want):8], want)
     self.assertEqual(self.run_asm8v(k % "load r4, 1, r1\nstore r4, 0, r1, #8")[8:16], [2.0 ** t for t in range(8)])   # store offset bit 3 (byte 10)
 
-  def run_asm8v(self, src:str) -> list[float]: # 8 threads over 2048-element inputs data1[i] = 2^(i mod 32), data2[i] = 100 + i; returns data0[:16]
+  def run_asm8v(self, src:str, group:bool=False) -> list[float]: # 8 threads (one threadgroup if group) over 2048-element inputs data1[i] = 2^(i mod 32), data2[i] = 100 + i; data0[:16]
     from tinygrad.runtime import ops_agx, ops_metal
     from tinygrad import codegen
     from tinygrad.runtime.support import hcq2
@@ -417,7 +417,7 @@ class TestAGX(unittest.TestCase):
     for c in (codegen.to_program_cache, hcq2.hcq_compile_cache, hcq2.link_linear_cache, realize.runtime_cache): c.clear()
     Device[Device.DEFAULT].wait_timeout_ms = 10000.0
     with patch.object(ops_agx.AGXRenderer, "render", lambda self, uops: src), \
-         patch.object(ops_metal.MetalQueue, "dims", staticmethod(lambda prg: (8, 1, 1, 1, 1, 1))):
+         patch.object(ops_metal.MetalQueue, "dims", staticmethod(lambda prg: (1, 1, 1, 8, 1, 1) if group else (8, 1, 1, 1, 1, 1))):
       x, y = Tensor([2.0 ** (i % 32) for i in range(2048)]).contiguous().realize(), Tensor([100.0 + i for i in range(2048)]).contiguous().realize()
       return (x + y).tolist()[:16]
 
@@ -429,6 +429,30 @@ class TestAGX(unittest.TestCase):
     np.testing.assert_array_equal((a + b).numpy(), A + B)
     np.testing.assert_array_equal((a * 2 + 1)[:, 4:20].numpy(), (A * 2 + 1)[:, 4:20])
     np.testing.assert_array_equal(a.sum(axis=1).numpy(), A.sum(axis=1))
+
+  def test_threadgroup_memory(self): # probes/tg: tgstore/tgload/barrier with the metadata allocation; one group of 8 threads, x[i] = 2^i
+    k = ".buffers 3\n.tgmem 256\nload r0, 1\n%s\nstore r4, 0\n"
+    for body, want in [("tgstore r0, r1\nbarrier\ntgload r4, r1", [2.0 ** t for t in range(8)]),
+                       ("movimm r3, #0x00000001\nixor r2, r1, r3\ntgstore r0, r1\nbarrier\ntgload r4, r2", [2.0 ** (t ^ 1) for t in range(8)]),   # a neighbour's slot
+                       ("tgstore r0, r1\nbarrier\ntgload r4, r1, #2", [2.0 ** (t + 2) for t in range(6)]),                                        # load offset
+                       ("tgstore r0, r1, #8\nbarrier\ntgload r4, r1, #8", [2.0 ** t for t in range(8)]),                                          # store offset
+                       ("tgstore r0, r1\nbarrier\ntgload4 r4, r1\nfadd r4, r4, r5\nfadd r4, r4, r6\nfadd r4, r4, r7", [15.0 * 2 ** t for t in range(5)])]:   # 4-wide
+      with self.subTest(body=body.split("\n")[-1]): self.assertEqual(self.run_asm8v(k % body, group=True)[:len(want)], want)
+
+  def test_group_reduce_tensors(self): # the optimizer's GROUP_REDUCE kernels: threadgroup buffer, barrier, second-stage loop, IF-guarded store
+    import numpy as np
+    A = np.random.default_rng(0).random((64, 4096), dtype=np.float32)
+    t = Tensor(A).contiguous().realize()
+    np.testing.assert_allclose(t.sum(axis=1).numpy(), A.sum(1), rtol=1e-5)
+    np.testing.assert_array_equal(t.max(axis=1).numpy(), A.max(1))
+    self.assertAlmostEqual(Tensor(A.ravel()).contiguous().realize().sum().item() / A.sum(), 1.0, places=5)
+
+  def test_long_loop(self): # counts above 255 hold the count in a register (probes/loop1000: loop_cmp byte 3 = register, loop_enter byte 1 = 00)
+    for n in (1000, 999, 256):
+      self.assertEqual(self.run_asm(f".buffers 3\nmovimm r3, #0x{n:08x}\nmovimm r4, #0.0\nloop r5, r3\nbody\nfadd r4, r4, #1.0\nendloop\nstore r4, 0\n", 1.5, 2.0), float(n))
+    a = [float(i % 7) for i in range(1000)]
+    from tinygrad.helpers import Context
+    with Context(NOOPT=1): self.assertEqual(Tensor(a).contiguous().realize().sum().item(), sum(a))
 
   def test_two_stores(self): # each store followed by STORE_WAIT; the second overwrites the first
     self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nstore r0, 0\nstore r2, 0\n", 1.5, 2.25), 2.25)

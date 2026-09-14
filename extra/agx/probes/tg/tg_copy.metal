@@ -1,0 +1,5 @@
+// threadgroup memory round trip: s[lid] = a; barrier; o[t] = s[lid]  (diff against tg_nobarrier / tg_xor)
+#include <metal_stdlib>
+using namespace metal;
+kernel void k(device float* o, device float* b, uint t [[thread_position_in_grid]], uint l [[thread_position_in_threadgroup]]) {
+  threadgroup float s[64]; s[l] = b[t]; threadgroup_barrier(mem_flags::mem_threadgroup); o[t] = s[l]; }

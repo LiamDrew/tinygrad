@@ -45,7 +45,7 @@ class AGXCompiler(Compiler):
   def disassemble(self, lib:bytes): print(dsl.disasm_str(text_section(split_archive(lib)[0])))
 
 class AGXRenderer(Renderer):
-  has_local, has_shared, supports_float4 = True, False, True    # threadgroups yes, threadgroup memory not yet; 2/4-wide loads and stores (scalar ALU)
+  has_local, has_shared, supports_float4 = True, True, True     # threadgroups, threadgroup memory (tgload/tgstore/barrier), 2/4-wide loads and stores; scalar ALU
   local_max = (1024, 1024, 1024)                                # MetalQueue: global_size = threadgroups, local_size = threads per group
   compiler = AGXCompiler()
   # hardware transcendentals (dsl.TRANS); tinygrad decomposes every float op missing here (SIN: codegen/decomp/transcendental.py). Values unused.
@@ -64,6 +64,7 @@ class AGXRenderer(Renderer):
     params = [u for u in uops if u.op is Ops.PARAM]
     assert [p.arg.slot for p in params] == list(range(len(params))), "buffers must be the call args 0..n-1"
     lines.append(f".buffers {len(params)}")
+    tgmem = [0]; local_base:dict[UOp, int] = {}   # threadgroup buffers: element offset of each within the allocation
     slot = {p: p.arg.slot for p in params}
     # fma: a float MUL whose only use is a float ADD folds into it (its operands are then read at the ADD)
     fused:dict[UOp, UOp] = {}
@@ -83,7 +84,7 @@ class AGXRenderer(Renderer):
     split:set[UOp] = set()   # vector loads lowered as per-element lazy scalar loads (offset + k): each element lives only from its own load to its last use
     def epos(c:UOp) -> int: return pos[fused[c]] if c in fused else emit_at.get(c, pos[c])   # where consumer c is actually emitted
     for u in uops:
-      if u.op is Ops.LOAD and strip(u.src[0].src[0]).op is not Ops.BUFFER and (us:=uses.get(u)):   # src[0]: INDEX, or SHRINK(param, start, n) for a vector
+      if u.op is Ops.LOAD and strip(u.src[0].src[0]).op is Ops.PARAM and (us:=uses.get(u)):   # global loads only; src[0]: INDEX, or SHRINK(param, start, n) for a vector
         us = [c for x in us for c in (uses.get(x, []) if x.op is Ops.INDEX else [x])]   # a vector load's users are element INDEXes; the real consumers are theirs
         first = min(epos(x) for x in us)
         # vector loads stay where tinygrad put them (the start of the unrolled body) while they fit a register budget: issuing them together and
@@ -219,23 +220,28 @@ class AGXRenderer(Renderer):
     acc_regs:dict[UOp, list[int]] = {}   # register-array accumulators: BUFFER (AddrSpace.REG, size n) -> n registers, indexed by constants
     def acc_of(store_or_load:UOp) -> tuple[UOp, int]|None: # (accumulator, element) behind an INDEX, or None for a memory buffer
       ix = store_or_load.src[0]; b = strip(ix.src[0])
-      if b.op is not Ops.BUFFER: return None
+      if b.op is not Ops.BUFFER or b.arg.addrspace is not AddrSpace.REG: return None
       k = cval(ix.src[1]); assert k is not None, "register accumulators need constant indices (they are registers, not memory)"
       return b, k
     def acc_reg(b:UOp, k:int) -> int: return acc_regs[b][k]
+    def local_of(u:UOp) -> UOp|None: # the LOCAL buffer behind a load/store's index, or None
+      b = strip(u.src[0].src[0]); return b if b.op is Ops.BUFFER and b.arg.addrspace is AddrSpace.LOCAL else None
 
     i = 0
     while i < len(uops):
       u = uops[i]
       if u in done or u in fused or u in deferred or is_free(u) or u.op in {Ops.PARAM, Ops.CONST, Ops.AFTER, Ops.SINK, Ops.NOOP, Ops.GROUP, Ops.INDEX, Ops.SHRINK, Ops.STACK}:
         expire(i); i += 1; continue
-      if u.op is Ops.BUFFER:                                    # register-resident accumulators: one register per element
-        assert u.arg.addrspace is AddrSpace.REG, f"{u.arg.addrspace} buffers are not implemented (threadgroup memory needs has_shared)"
+      if u.op is Ops.BUFFER and u.arg.addrspace is AddrSpace.LOCAL:   # threadgroup memory: carve the allocation (element offsets)
+        assert u.dtype.itemsize == 4; local_base[u] = tgmem[0] // 4; tgmem[0] += u.arg.size * 4
+      elif u.op is Ops.BUFFER:                                  # register-resident accumulators: one register per element
+        assert u.arg.addrspace is AddrSpace.REG, f"{u.arg.addrspace} buffers are not implemented"
         acc_regs[u] = [alloc(u) for _ in range(u.arg.size)]
       elif u.op is Ops.RANGE:
         n = cval(u.src[0]); assert n is not None, "symbolic loop bounds are not supported yet"
         c = alloc_low(u)
-        lines.append(f"loop r{c}, #{n}")
+        if n > 255: rn = alloc_int(u); lines.append(f"movimm r{rn}, #0x{n:08x}"); lines.append(f"loop r{c}, r{rn}")   # register-held count (owned by the RANGE: live to END)
+        else: lines.append(f"loop r{c}, #{n}")
         # the counter reads 0..n-1 only in the pre section; copy it there so inner loops (where it already reads 1..n) see the 0-based value
         v = alloc_int(u); reg[u] = v; lines.append(f"addr r{v}, r{c}, 0, #0")
         lines.append("body")   # address math stays in the body in program order (hoisting it kept every address live for the whole loop)
@@ -243,10 +249,14 @@ class AGXRenderer(Renderer):
       elif u.op is Ops.LOAD:
         ix = u.src[0]
         if (acc:=acc_of(u)) is not None: reg[u] = acc_reg(*acc)  # accumulator read: alias
+        elif (lb:=local_of(u)) is not None:
+          base, off = idx_split(ix.src[1]); d = alloc(u); reg[u] = d; lines.append(f"tgload r{d}, r{base}, #{off + local_base[lb]}")
         elif u not in lazy and u not in split: emit_load(u)     # lazy loads are emitted by val() at their first use
       elif u.op is Ops.STORE:
         ix, v = u.src[0], u.src[1]
-        if (acc:=acc_of(u)) is not None:                        # accumulator write
+        if (lb:=local_of(u)) is not None:
+          base, off = idx_split(ix.src[1]); lines.append(f"tgstore r{val(v)}, r{base}, #{off + local_base[lb]}")
+        elif (acc:=acc_of(u)) is not None:                      # accumulator write
           ra = acc_reg(*acc)
           if cval(v) is not None: lines.append(f"movimm r{ra}, #{float(cval(v)) if dtypes.is_float(v.dtype) else '0x%08x' % (int(cval(v)) & 0xffffffff)}")
           elif (rv:=val(v)) != ra: lines.append(f"ior r{ra}, r{rv}, r{rv}")   # register move (bitwise, any 32-bit type)
@@ -285,6 +295,7 @@ class AGXRenderer(Renderer):
         ra = val(u.src[0]); d = alloc(u); reg[u] = d
         if u.op is Ops.SQRT: lines.append(f"rsqrts r{d}, r{ra}"); lines.append(f"fmul r{d}, r{ra}, r{d}")
         else: lines.append(f"{ {Ops.EXP2: 'exp2', Ops.LOG2: 'log2', Ops.RECIPROCAL: 'rcp'}[u.op] } r{d}, r{ra}")
+      elif u.op is Ops.BARRIER: lines.append("barrier")
       elif u.op is Ops.IF: lines.append(f"if r{val(u.src[0])}")     # per-thread predication of the region up to ENDIF
       elif u.op is Ops.ENDIF: lines.append("endif")
       elif u.op is Ops.SPECIAL:                                 # ("g"|"l", axis): threadgroup_position_in_grid / thread_position_in_threadgroup
@@ -311,6 +322,7 @@ class AGXRenderer(Renderer):
         d = alloc_int(u) if is_int(u) else alloc(u); reg[u] = d; lines.append(f"{mn} r{d}, r{ra}, r{rb}, r{rx}, r{ry}")
       else: raise NotImplementedError(f"AGX renderer: {u.op} {u.dtype}")
       expire(i); i += 1
+    if tgmem[0]: lines.insert(1, f".tgmem {tgmem[0]}")
     return "\n".join(lines) + "\n"
 
 # *****************

@@ -132,9 +132,10 @@ LOOP_INIT = Inst("loop_init", bytes.fromhex("0b0020c0"), (Field("dst", B(0, 4), 
 LOOP_INC = Inst("loop_inc", bytes.fromhex("9f01040003000088 1504".replace(" ", "")), (
   Field("dst", B(3, 1), 7), Field("step", B(5, 1), 7), Field("src", B(6, 3), 5)),   # src: counter register << 3 (r3 -> 18, r6 -> 30)
   doc="counter = counter + step")
-LOOP_CMP = Inst("loop_cmp", bytes.fromhex("0a002380"), (Field("depth2", B(0, 4), 4), Field("src", B(1), 8), Field("n_hi", B(2, 4), 1), Field("n", B(3, 1), 6)),
-  doc="compare counter with n (even, n/2 in 7 bits: n low 6 + n_hi; probes/loop250.metal). src: (reg<<1)|1; depth2 = 2 * nesting depth. Apple holds counts above 254 in a register")
-LOOP_ENTER = Inst("loop_enter", bytes.fromhex("07020000"), (Field("extra", B(0, 4), 1),), doc="loop control; extra = one more iteration")
+LOOP_CMP = Inst("loop_cmp", bytes.fromhex("0a002300"), (Field("depth2", B(0, 4), 4), Field("src", B(1), 8), Field("n_hi", B(2, 4), 1), Field("nreg", B(3, 0), 1), Field("n", B(3, 1), 7)),
+  doc="compare counter with n: immediate (n/2 in 7 bits: n low 6 + n_hi, byte 3 bit 7 set) or, with nreg, byte 3 = (reg<<1)|1 holding the full count "
+      "(probes/loop1000.metal: 0a 0b 23 07 = counter r5, count in r3; hardware-verified for 256, 999, 1000). src: (reg<<1)|1; depth2 = 2 * nesting depth")
+LOOP_ENTER = Inst("loop_enter", bytes.fromhex("07000000"), (Field("extra", B(0, 4), 1), Field("imm", B(1, 1), 1)), doc="loop control; extra = one more iteration; imm set with an immediate count (Apple: 07 02 ..), clear with a register count (07 00 ..)")
 LOOP_TAIL = Inst("loop_tail", bytes.fromhex("8f045422"), (Field("depth4", B(3, 2), 6),), doc="loop control before the back branch; byte3 = 0x22 + 4 * nesting depth")
 BRANCH = Inst("branch", bytes.fromhex("0f00540000000000ff00"), (Field("off", B(3), 40),), doc="pc += off (relative to this instruction's address); 10 bytes")
 LOOP_EXIT = Inst("loop_exit", bytes.fromhex("0f0604020000"), doc="after the loop; stores do not land without it")
@@ -160,6 +161,20 @@ STORE = Inst("store", bytes.fromhex("e700540000002000 110000101000".replace(" ",
   Field("s7", B(11, 7), 1), Field("fmt", B(12, 0), 4)),
   doc="buf[slot][areg + off ..] = src[..count] (32-bit elements)")
 STORE_IDX = STORE # old name
+# threadgroup memory (probes/tg, 2026-09-14): the same 14-byte shape with byte 1 = 02, byte 6 = 00 and the index register at byte 5 << 2 (r1 -> 04,
+# r2 -> 08, r4 -> 10; byte 6 bit 7 kills it). byte 4 = 08 in every probe (meaning unknown, kept fixed). Tails differ from device memory:
+# load 44 0d 00 c0 08 00 (4-wide: 5c 0d), store 44 02 00 30 02 00; the load's element offset sits like a device load's (s[t + 8] -> byte 10 = 04).
+# The barrier is the 6-byte 07 04 54 61 09 00 (present exactly when the source has threadgroup_barrier). The allocation size is metadata fn field 28
+# (bytes: s[64] -> 256, s[1024] -> 4096).
+TG_LOAD = Inst("tgload", bytes.fromhex("6702540000000000 440d00c00800".replace(" ", "")), (
+  Field("wait", B(2, 1), 1), Field("dst", B(3, 1), 7), Field("base", B(4), 8), Field("a", B(5, 2), 6), Field("killa", B(6, 7), 1),
+  Field("w4", B(8, 3), 2), Field("off0", B(9, 7), 1), Field("off1", B(10), 8)),
+  doc="dst[..count] = threadgroup[(a + off) * 4 ..]; w4 = 3 for a 4-wide load (Apple: 5c)")
+TG_STORE = Inst("tgstore", bytes.fromhex("e702540000000000 440200300200".replace(" ", "")), (
+  Field("wait", B(2, 1), 1), Field("src", B(3, 1), 7), Field("base", B(4), 8), Field("a", B(5, 2), 6), Field("killa", B(6, 7), 1),
+  Field("w4", B(8, 3), 2), Field("off0", B(9, 5), 3), Field("off3", B(10), 8)),
+  doc="threadgroup[(a + off) * 4 ..] = src[..count]; offset laid out like a device store's (hardware-verified: +1, +2, +8)")
+TG_BARRIER = Inst("barrier", bytes.fromhex("070454610900"), doc="threadgroup_barrier(mem_threadgroup)")
 def store_off_fields(off:int) -> dict[str, int]:
   assert 0 <= off < (1 << 11), f"store offset {off} does not fit"
   return dict(off0=off & 7, off3=off >> 3)
@@ -314,7 +329,7 @@ SR = {"tid.x": 0xa0, "tid.y": 0xa1, "tid.z": 0xa2, "gid.x": 0x9c, "gid.y": 0x9d,
 GET_SR = Inst("getsr", bytes.fromhex("0c001006"), (Field("dst", B(0, 4), 4), Field("sr", B(1), 8)), doc="dst = special register (dst nibble only: r0..r15)")
 GET_TID = GET_SR # old name; the prologue reads tid.x into r1
 
-TABLE = (LOAD, IF_BEGIN, IF_END, FMAX, FMIN, I2F, U2F, F2I, F2U, RCP, RSQRT, RSQRTS, EXP2, LOG2, SHL_IMM, LSHR_IMM, ASHR_IMM, SHL_REG, LSHR_REG, ASHR_REG, IADD, ISUB, INEG, IMUL_RR, IAND, IOR, IXOR, IMAX, IMIN, ISEL4, ISEL, ICMP, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STOP, NOP)
+TABLE = (LOAD, TG_LOAD, TG_STORE, TG_BARRIER, IF_BEGIN, IF_END, FMAX, FMIN, I2F, U2F, F2I, F2U, RCP, RSQRT, RSQRTS, EXP2, LOG2, SHL_IMM, LSHR_IMM, ASHR_IMM, SHL_REG, LSHR_REG, ASHR_REG, IADD, ISUB, INEG, IMUL_RR, IAND, IOR, IXOR, IMAX, IMIN, ISEL4, ISEL, ICMP, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STOP, NOP)
 
 def movimm_bits_fields(v:int) -> dict[str, int]: return {n: (v >> lo) & ((1 << w) - 1) for n, lo, w in _MOVIMM_SLICES}
 def movimm_fields(f:float) -> dict[str, int]: return movimm_bits_fields(struct.unpack("<I", struct.pack("<f", f))[0])
@@ -332,13 +347,16 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
   if inst is IMUL: return f"imul r{d['dst']}, #{d['stride']}"
   if inst is LOOP_INIT: return f"loop_init r{d['dst']}"
   if inst is LOOP_INC: return f"loop_inc r{d['dst']}, r{d['src']}, #{d['step']}"
-  if inst is LOOP_CMP: return f"loop_cmp r{d['src'] >> 1}, #{(d['n'] | d['n_hi'] << 6) << 1}" + (f" ; depth {d['depth2'] >> 1}" if d["depth2"] else "")
+  if inst is LOOP_CMP: return f"loop_cmp r{d['src'] >> 1}, " + (f"r{d['n'] >> 0}" if d["nreg"] else f"#{((d['n'] & 0x3f) | d['n_hi'] << 6) << 1}") + (f" ; depth {d['depth2'] >> 1}" if d["depth2"] else "")
   if inst is LOOP_TAIL: return "loop_tail" + (f" ; depth {d['depth4'] - 8}" if d["depth4"] != 8 else "")
   if inst is LOOP_ENTER: return "loop_enter" + (" ; extra" if d["extra"] else "")
   if inst is BRANCH: return f"branch {d['off'] - (1 << 40) if d['off'] >> 39 else d['off']:+d}"
   if inst is STORE:
     n = count_of(d); return f"store{n if n > 1 else ''} r{d['src']}, {d['slot']}, r{d['areg']}" + (f", #{store_off(d)}" if store_off(d) else "") + \
       "".join(f" ; {n}" for n in ("first", "wait", "killa", "last") if d[n]) + (f" ; fmt {d['fmt']}" if d["fmt"] != 1 else "")
+  if inst is TG_LOAD or inst is TG_STORE:
+    r = d["dst"] if inst is TG_LOAD else d["src"]; off = (d["off0"] | d["off1"] << 1) if inst is TG_LOAD else store_off(d)
+    return f"{inst.mnemonic}{4 if d['w4'] == 3 else ''} r{r}, r{d['a']}" + (f", #{off}" if off else "") + "".join(f" ; {n}" for n in ("wait", "killa") if d[n]) + (f" ; base {d['base']:02x}" if d["base"] != 8 else "")
   if inst is FALU or inst is FALU_LONG:
     op, dst, a = "fmul" if d["mul"] else "fadd", f"r{dst_reg(d)}", f"r{operand_reg(d['srca'])}"
     flags = "".join(f" ; {n}" for n in ("killa", "killb", "fwd") if d[n]) + (f" ; tag {d['tag']:02x}" if inst is FALU_LONG and d["tag"] != 0xc0 else "")
