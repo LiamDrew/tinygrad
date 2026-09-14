@@ -15,9 +15,17 @@ def i_addr(dst, shift, imm=None, breg=None): # rD = (r1 << shift) + imm, or + rB
     return dsl.ADDR.encode(dst=dst, b=b, breg=int(breg is not None), shift0=shift & 1, shift1=(shift >> 1) & 1, noshift=int(shift == 0))
 def i_imul(dst, stride): return dsl.IMUL.encode(dst=dst, stride=stride)
 def i_wait(): return dsl.WAIT.encode()
+def loop_head(c, n): # returns bytes and the offset (within them) of the increment, the back-branch target
+    assert n >= 2, "loop counts below 2 hang the GPU"
+    head = dsl.LOOP_INIT.encode(dst=c)
+    inc_at = len(head)
+    head += dsl.LOOP_INC.encode(dst=c, step=1, src=c) + dsl.LOOP_CMP.encode(src=dsl.reg_operand(c), n=n >> 1) + dsl.NOP.encode() + dsl.LOOP_ENTER.encode(extra=n & 1)
+    return head, inc_at
+def loop_tail(back): # back: bytes from the increment to here
+    return dsl.LOOP_TAIL.encode() + dsl.BRANCH.encode(off=(-(back + dsl.LOOP_TAIL.size)) & 0xffffffffff) + dsl.LOOP_EXIT.encode()
 def i_falu_imm(dst,a,imm,mul=0,wait=True): # an immediate needs the six-byte form (byte4 bit7); tail c0 only when waiting for loads
     b,neg=dsl.e4m3(imm)
-    return dsl.FALU_LONG.encode(dst=dst, srcb=b, mul=mul, killb=int(neg), killa=1, srca=dsl.reg_operand(a), ext=0x80, tag=0xc0 if wait else 0x20)
+    return dsl.FALU_LONG.encode(dst=dst, srcb=b, mul=mul, killb=int(neg), killa=1, srca=dsl.reg_operand(a), ext=0x80, tag=0xc0 if wait else 0x00) # Apple: 00 in loop bodies
 def i_falu_reg(dst,a,bb,mul=0,wait=True): # waiting (six-byte, tail c0) for the first consumer of loads, else the four-byte form, like Apple
     if wait: return dsl.FALU_LONG.encode(dst=dst, srcb=dsl.reg_operand(bb), mul=mul, killa=1, killb=1, srca=dsl.reg_operand(a), tag=0xc0)
     return dsl.FALU.encode(dst=dst, srcb=dsl.reg_operand(bb), mul=mul, killa=1, killb=1, srca=dsl.reg_operand(a))
@@ -30,7 +38,7 @@ EPILOGUE     = dsl.STOP.encode() # the last store's wait precedes it
 
 def assemble_text(program):
     """Return (text_bytes, N, written slots). Builds preamble(0..0x40) + main + epilogue."""
-    N=0; main=bytearray(); load_i=0; written=set(); seen_mem=False; pending=False # pending: loads issued, nothing waited yet
+    N=0; main=bytearray(); load_i=0; written=set(); seen_mem=False; pending=False; loops=[] # pending: loads issued, nothing waited yet
     main+=dsl.GET_TID.encode()                            # thread-index prologue
     lines=[l.split(';')[0].strip() for l in program.splitlines()]  # ';' comments only ('#'=imm)
     lines=[l for l in lines if l]
@@ -53,6 +61,11 @@ def assemble_text(program):
             else: main+=i_addr(reg(p[1]), int(p[2]), breg=reg(p[3]))
         elif op=='imul':                                 # imul rD, #stride : rD = t * stride
             main+=i_imul(reg(p[1]), int(p[2].lstrip('#')))
+        elif op=='loop':                                 # loop rC, #n ... endloop : body runs n times with rC = 1..n
+            head, inc_at = loop_head(reg(p[1]), int(p[2].lstrip('#')))
+            loops.append(len(main) + inc_at); main+=head; pending=False   # loop_init's tail waits for loads
+        elif op=='endloop':
+            main+=loop_tail(len(main) - loops.pop())
         elif op=='wait':
             main+=i_wait()
         elif op in ('fadd','fmul'):

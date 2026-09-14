@@ -92,6 +92,20 @@ IMUL = Inst("imul", bytes.fromhex("9f1054000204000050200200"), (
   Field("dst", B(3, 1), 7),
   Field("stride", B(6, 2), 14)),
   doc="dst = r1 * stride (elements)")
+# counted loop (probes/loop*.metal, hardware-verified in test_agx). Layout the assembler emits:
+#   LOOP_INIT c=0 | L: LOOP_INC c += step | LOOP_CMP c, n | NOP | LOOP_ENTER | body | LOOP_TAIL | BRANCH L | LOOP_EXIT
+# the loop exits when c == n after the increment, so the body sees c = step, 2*step, ..., n. n must be even in LOOP_CMP; LOOP_ENTER's
+# `extra` bit adds one iteration for odd counts. Counts of 0 and 1 in LOOP_CMP hang the GPU.
+LOOP_INIT = Inst("loop_init", bytes.fromhex("0b0020c0"), (Field("dst", B(0, 4), 4),), doc="counter = 0; carries the load wait (tail c0)")
+LOOP_INC = Inst("loop_inc", bytes.fromhex("9f01040003000088 1504".replace(" ", "")), (
+  Field("dst", B(3, 1), 7), Field("step", B(5, 1), 7), Field("src", B(6, 3), 5)),   # src: counter register << 3 (r3 -> 18, r6 -> 30)
+  doc="counter = counter + step")
+LOOP_CMP = Inst("loop_cmp", bytes.fromhex("0a002380"), (Field("src", B(1), 8), Field("n", B(3, 1), 6)),   # src: (reg<<1)|1; bit0 of byte3 ignored
+  doc="compare counter with n (even)")
+LOOP_ENTER = Inst("loop_enter", bytes.fromhex("07020000"), (Field("extra", B(0, 4), 1),), doc="loop control; extra = one more iteration")
+LOOP_TAIL = Inst("loop_tail", bytes.fromhex("8f045422"), doc="loop control before the back branch, constant in every probe")
+BRANCH = Inst("branch", bytes.fromhex("0f00540000000000ff00"), (Field("off", B(3), 40),), doc="pc += off (relative to this instruction's address); 10 bytes")
+LOOP_EXIT = Inst("loop_exit", bytes.fromhex("0f0604020000"), doc="after the loop; stores do not land without it")
 STORE = Inst("store", bytes.fromhex("e700540000012000"), (
   Field("first", B(1, 4), 1),       # set when no load preceded (probes/movimm.metal)
   Field("wait", B(2, 1), 1),        # wait for outstanding loads first (0x56). Required on the first consumer of load data, see LOAD_WAIT_MODEL
@@ -133,7 +147,7 @@ STORE_WAIT = Inst("store_wait", bytes.fromhex("110000901100"),
   doc="wait for the preceding store. Apple emits one after every store; two stores back to back lose data without it (test_agx)")
 BARRIER = STORE_WAIT # old name
 
-TABLE = (LOAD_IDX, LOAD, IMUL, ADDR, STORE, WAIT, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
+TABLE = (LOAD_IDX, LOAD, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
 
 def movimm_fields(f:float) -> dict[str, int]:
   v = struct.unpack("<I", struct.pack("<f", f))[0]
@@ -149,6 +163,11 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
     sh = 0 if d["noshift"] else (d["shift0"] | d["shift1"] << 1) or 4
     return f"addr r{d['dst']}, {sh}, " + (f"r{d['b'] >> 2}" if d["breg"] else f"#{d['b'] >> 1}")
   if inst is IMUL: return f"imul r{d['dst']}, #{d['stride']}"
+  if inst is LOOP_INIT: return f"loop_init r{d['dst']}"
+  if inst is LOOP_INC: return f"loop_inc r{d['dst']}, r{d['src']}, #{d['step']}"
+  if inst is LOOP_CMP: return f"loop_cmp r{d['src'] >> 1}, #{d['n'] << 1}"
+  if inst is LOOP_ENTER: return "loop_enter" + (" ; extra" if d["extra"] else "")
+  if inst is BRANCH: return f"branch {d['off'] - (1 << 40) if d['off'] >> 39 else d['off']:+d}"
   if inst is STORE: return f"store r{d['src']}, {d['slot']}" + "".join(f" ; {n}" for n in ("first", "wait", "last") if d[n])
   if inst is FALU or inst is FALU_LONG:
     op, dst, a = "fmul" if d["mul"] else "fadd", f"r{d['dst']}", f"r{operand_reg(d['srca'])}"

@@ -29,7 +29,7 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
     text, _, _ = asm.assemble_text("movimm r0, #42.0\nfadd r0, r0, #-3.5\nstore r0, 0\n")
     body = [t for _, _, t in dsl.disassemble(text)]
     self.assertIn("movimm r0, #42", body)
-    self.assertIn("fadd r0, r0, #-3.5 ; killa ; killb ; tag 20", body) # no loads pending: not a waiting op
+    self.assertIn("fadd r0, r0, #-3.5 ; killa ; killb ; tag 00", body) # no loads pending: not a waiting op
 
 @unittest.skipUnless(Device.DEFAULT == "AGX", "AGX device required")
 class TestAGX(unittest.TestCase):
@@ -58,6 +58,7 @@ class TestAGX(unittest.TestCase):
     from tinygrad.runtime.support import hcq2
     from tinygrad.engine import realize
     for c in (codegen.to_program_cache, hcq2.hcq_compile_cache, hcq2.link_linear_cache, realize.runtime_cache): c.clear()
+    Device[Device.DEFAULT].wait_timeout_ms = 10000.0 # a hand-built kernel either finishes at once or hung the GPU
     with patch.object(ops_agx.AGXRenderer, "render", lambda self, uops: src), \
          patch.object(ops_metal.MetalQueue, "dims", staticmethod(lambda prg: (8, 1, 1, 1, 1, 1))):
       x, y = Tensor(a).contiguous().realize(), Tensor(b).contiguous().realize()
@@ -81,6 +82,17 @@ class TestAGX(unittest.TestCase):
     self.assertEqual(self.run_asm8(".buffers 3\naddr r4, 1, r1\nload r0, 1, r4\nwait\nstore r0, 0\n", a, a), a[0:24:3])   # (t<<1) + t
     self.assertEqual(self.run_asm8(".buffers 3\naddr r4, 4, #0\nload r0, 1, r4\nwait\nstore r0, 0\n", a, a), a[0:128:16]) # shift 4
     self.assertEqual(self.run_asm8(".buffers 3\nimul r4, #5\naddr r6, 1, r4\nload r0, 1, r6\nwait\nstore r0, 0\n", a, a), a[0:56:7]) # 2t + 5t
+
+  def test_loop(self): # counted loop: s = a[t]; n times s += 1
+    a = [float(i) for i in range(8)]
+    for c, n in ((3, 4), (6, 4), (3, 3), (3, 5), (3, 16)):
+      with self.subTest(counter=c, n=n):
+        self.assertEqual(self.run_asm8(f".buffers 3\nload r2, 1\nwait\nloop r{c}, #{n}\nfadd r2, r2, #1.0\nendloop\nstore r2, 0\n", a, a), [x + n for x in a])
+
+  def test_reduce(self): # the first reduction: out[t] = sum of a[8t+1 .. 8t+8] (the counter is 1..8 inside the body)
+    a = [float(i * i % 17) for i in range(72)]
+    src = ".buffers 3\nloop r3, #8\naddr r6, 3, r3\nload r8, 1, r6\nwait\nfadd r2, r2, r8\nendloop\nstore r2, 0\n"
+    self.assertEqual(self.run_asm8(src, a, a), [sum(a[8 * t + 1:8 * t + 9]) for t in range(8)])
 
   def test_addr_register(self): # the offset can live in another register (probe with r0 busy: 9f ... 04 / load byte5 82)
     a = [float(i) for i in range(16)]
