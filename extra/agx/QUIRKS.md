@@ -81,19 +81,20 @@ Ablation - delete instructions from a real kernel and measure - is the profiler,
 
 ## The baseline that matters: Apple's MPS
 `extra/agx/mps_ref.py` runs `MPSMatrixMultiplication`, Apple's tuned library, through objc and times it with the command buffer's GPU
-timestamps. Alternated against ours, fp32:
+timestamps. **Measure it with `REPS=20`**, which encodes 20 multiplications into one command buffer: with one per buffer a 1024 matmul
+reads 484-923 us against a 416 us steady state, because the GPU drops its clock between short launches. fp32, both sides measured in
+their steady state:
 
-  | N    | mm_direct | Apple MPS | tinygrad on Metal | pure-mma ceiling |
-  |------|-----------|-----------|-------------------|------------------|
-  | 1024 | 436 us    | 484 us    | 431 us            | -                |
-  | 2048 | 3157 us   | 3200 us   | 3196 us           | 2920 us          |
+  | N    | mm_direct | Apple MPS | pure-mma ceiling |
+  |------|-----------|-----------|------------------|
+  | 1024 | 436 us    | 415 us    | -                |
+  | 2048 | 3155 us   | 3211 us   | 2920 us          |
 
-We are ahead of the vendor library at both sizes, by 10% at 1024 and 1.4% at 2048. Two honest caveats: MPS is general (any shape,
-transposes, alpha/beta) where mm_direct is specialised to square non-transposed power-of-two sizes, and the two are timed by
-different mechanisms though both measure GPU execution.
-The corroborating point is that MPS also sits ~9% above the pure-mma ceiling. Apple's own tuned library cannot close that gap
-either, which is the strongest evidence that the gap is the irreducible cost of feeding the matrix unit rather than something we
-have failed to find.
+It goes both ways: MPS is 4.7% faster at 1024 and we are 1.8% faster at 2048. An earlier version of this table claimed we were ahead at
+both sizes; that came from comparing our steady state against an MPS number taken one-per-command-buffer, which is not a steady state.
+At 1024 our tile gives only 256 threadgroups, and a smaller tile might feed the 10 cores better; untested.
+The corroborating point stands: MPS also sits ~9% above the pure-mma ceiling at 2048, so Apple's tuned library cannot close that gap
+either, which is the strongest evidence that it is the irreducible cost of feeding the matrix unit.
 
 ## Apple's compiler on our own algorithm
 - `extra/agx/mm_metal_ref.py` writes mm_direct's exact algorithm in Metal and runs Apple's compiled output through the same dispatch.

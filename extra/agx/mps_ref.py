@@ -38,13 +38,15 @@ mm = msg(msg(cls('MPSMatrixMultiplication'), 'alloc'),
          ctypes.c_double(1.0), ctypes.c_double(0.0),
          argtypes=[P, ctypes.c_bool, ctypes.c_bool, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_double, ctypes.c_double])
 assert mm, "MPSMatrixMultiplication init failed"
+REPS = int(__import__('os').getenv("REPS", "1"))   # multiplications per command buffer: REPS>1 keeps the GPU busy so the clock does not drop
 ts = []
 for i in range(12):
   cb = msg(q, 'commandBuffer')
-  msg(mm, 'encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:', cb, ma, mb, mc, restype=None, argtypes=[P, P, P, P])
+  for _ in range(REPS):
+    msg(mm, 'encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:', cb, ma, mb, mc, restype=None, argtypes=[P, P, P, P])
   msg(cb, 'commit', restype=None); msg(cb, 'waitUntilCompleted', restype=None)
   f = ctypes.CFUNCTYPE(ctypes.c_double, P, P)(ctypes.cast(lib.objc_msgSend, P).value)
   t0 = f(cb, objc.getsel(b'GPUStartTime')); t1 = f(cb, objc.getsel(b'GPUEndTime'))
-  ts.append((t1 - t0) * 1e6)
+  ts.append((t1 - t0) * 1e6 / REPS)
 got = np.frombuffer(ctypes.string_at(msg(bc, 'contents'), nbytes), np.float32).reshape(N, N)
 print(f"MPS N={N}: min {min(ts):8.1f} us  median {sorted(ts)[len(ts)//2]:8.1f} us  maxerr {np.abs(got - A @ B).max():.4g}")
