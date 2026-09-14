@@ -340,7 +340,9 @@ def build(program):
     """Assemble `program` and return (archive_bytes, N)."""
     MAXREG[0]=0; TGMEM[0]=0
     text,N,written=assemble_text(program)
-    md=gen_metadata(N, written, nregs=min(128, (MAXREG[0] + 9) // 8 * 8 + 8), tgmem=TGMEM[0])   # Apple writes max_reg+1..+7 (r7 -> 10, r23 -> 30, r47 -> 50); the count sets occupancy (2x over-declaring cost 2x on matmul). One extra 8-block of margin
+    nregs=int(__import__('os').getenv('AGX_NREGS') or min(128, (MAXREG[0] + 9) // 8 * 8 + 8))   # AGX_NREGS is for experiments only
+    assert nregs > MAXREG[0], f"declared register count {nregs} does not cover r{MAXREG[0]}; under-declaring froze the machine once (QUIRKS.md)"
+    md=gen_metadata(N, written, nregs=nregs, tgmem=TGMEM[0])   # Apple writes max_reg+1..+7 (r7 -> 10, r23 -> 30, r47 -> 50); the count sets occupancy (2x over-declaring cost 2x on matmul). One extra 8-block of margin
     return build_archive(text, md, N), N
 
 if __name__=='__main__':

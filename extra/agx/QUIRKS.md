@@ -35,6 +35,25 @@ Freezes and hangs are marked. Never emit an instruction whose fields you have no
 - What this does NOT buy: splitting the matmul's loads across both slots so the first four mmas start early measures 3155.8 us against 3156.6
   for one slot at N=2048, i.e. nothing. The kernel is matrix-issue bound and starting an mma earlier does not help.
 
+## Kill bits: what they are and what they are not
+- Semantics are settled (`dsl.KILL_MODEL`): setting a source's kill bit makes that register read as 0 afterwards. Apple's compiler sets them on
+  the last use of every value. We emit none, and thousands of kernels have run correctly without them, so they are not functionally required.
+- **No measurable performance effect.** A deliberately memory-latency-bound kernel (16 widely strided loads per thread, summed) with the kill bit
+  on every fadd's last-use operand measured 57.9 / 55.5 us against 57.4 / 56.1 without: inside the noise.
+- They are **not** a dynamic occupancy mechanism. Occupancy comes from the *declared* register count in the metadata, which is static, and
+  varying it over its valid range produced no reliable difference on either a matmul (issue-bound, so none is expected: 3157 us at every value
+  from 64 to 128) or the latency-bound kernel once measurement artifacts were controlled.
+- The matrix op is the exception to the kill model: neither the bits Apple sets on last uses (byte 8 bit 7, byte 9 bit 0) nor the `live_a` /
+  `live_b` flags zero their operands. We have no encoding that kills an mma operand.
+- **Never declare fewer registers than the kernel names.** That is what froze the machine (Registers, above); `asm.build` now asserts it.
+
+## Measuring, part two: cache residency
+- The same latency-bound kernel measured 21 us in two process launches and 55 in a third, with identical bytes. Its working set is 4.4 MB, right
+  at the edge of what stays resident, so whether the buffer survives between launches changes the answer by 2.6x. An earlier "12% faster at 64
+  declared registers" on an elementwise kernel was the same artifact: eight launches of one fixed configuration spread 408-422 us and the fast
+  mode never recurred. Any effect below ~10% on a memory-bound kernel is not measurable this way. Effects on the matmul are trustworthy because
+  min and median agree to 0.1% across launches.
+
 ## Loads, stores, waits (`dsl.LOAD_WAIT_MODEL`)
 - A load or store is 14 bytes: 8 address bytes + a 6-byte tail that MUST directly follow (two loads then two tails read 0). The tail was
   mistaken for a separate "wait" instruction for a week. It holds the vector width (byte 8 bits 1..3: 1->0, 2->4, 3->6, 4->3), the immediate
