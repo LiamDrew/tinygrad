@@ -497,6 +497,21 @@ class TestAGX(unittest.TestCase):
         A, B = np.random.default_rng(n).random((n, n), dtype=np.float32), np.random.default_rng(n + 1).random((n, n), dtype=np.float32)
         with self.subTest(n=n): np.testing.assert_allclose((Tensor(A).contiguous().realize() @ Tensor(B).contiguous().realize()).numpy(), A @ B, rtol=1e-5, atol=1e-4)
 
+  def test_scoreboard_slots(self): # dsl.SCOREBOARD: two slots; a load names its slot, a consumer picks which slot to wait on
+    ld = lambda slot, reg=4: "raw " + dsl.LOAD.encode(first=1, more=0, dst=reg, slot=1, areg=1, wcode=dsl.WCODE[1], fmt=6, sb0=2 * slot).hex(" ")
+    fa = lambda tag: "raw " + dsl.FALU_LONG.encode(**dsl.dst_fields(8), srcb=dsl.reg_operand(4), mul=0, srca=dsl.reg_operand(4), tag=tag).hex(" ")
+    st = lambda reg=8: "raw " + dsl.STORE.encode(first=0, wait=0, src=reg, slot=0, areg=1, last=1, wcode=dsl.WCODE[1], s7=1, fmt=1).hex(" ")
+    landed = [2.0 ** (t + 1) for t in range(8)]
+    for slot, tag, waits in [(0, 0xc0, True), (0, 0x80, False), (1, 0x80, True), (1, 0xc0, False)]:   # float ALU: tail c0 = slot 0, 80 = slot 1
+      with self.subTest(slot=slot, tag=hex(tag)):
+        got = self.run_asm8v(".buffers 3\n" + ld(slot) + "\n" + fa(tag) + "\n" + st() + "\n")[:8]
+        self.assertEqual(got == landed, waits, got)
+    for slot, b1, b2, waits in [(0, 0x02, 0x56, True), (0, 0x02, 0x54, False), (1, 0x82, 0x54, True), (1, 0x02, 0x56, False)]:   # addr family: byte 2 bit 1 = slot 0, byte 1 bit 7 = slot 1
+      with self.subTest(slot=slot, b1=hex(b1), b2=hex(b2)):
+        e = bytearray(dsl.MMA.encode(dst=8, a=4, b=4, c=0, acc=0, creg=0, wait=0)); e[1], e[2] = b1, b2
+        got = self.run_asm8v(".buffers 3\n" + ld(slot) + "\nraw " + bytes(e).hex(" ") + "\n" + st(4) + "\n")[:8]
+        self.assertEqual(got == [2.0 ** t for t in range(8)], waits, got)   # the mma's own result is ignored; it is here only to wait
+
   def test_two_stores(self): # each store followed by STORE_WAIT; the second overwrites the first
     self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nstore r0, 0\nstore r2, 0\n", 1.5, 2.25), 2.25)
 

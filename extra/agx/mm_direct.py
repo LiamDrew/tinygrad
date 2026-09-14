@@ -18,9 +18,16 @@ Device['AGX'].wait_timeout_ms = 10000.0
 acc = lambda i, j: 32 + 2 * (4 * i + j)
 AFRAG = [16, 18, 20, 22]
 BFRAG = [24, 26, 28, 30]
-body = "\n".join([f"load2 r{AFRAG[i]}, 1, r{5 + i}" for i in range(4)] +
-                 [f"load2 r{BFRAG[j]}, 2, r9" + (f", #{8 * j}" if j else "") for j in range(4)] +
-                 [f"mma r{acc(i, j)}, r{AFRAG[i]}, r{BFRAG[j]}, r{acc(i, j)}" for i in range(4) for j in range(4)] +
+import os
+# SLOTS=1: put half the fragments on scoreboard slot 1 (dsl.SCOREBOARD) and order the mmas so the four that need only the slot-0
+# fragments run while the slot-1 loads are still in flight. Each mma waits on whichever slots are still pending.
+SLOTS = os.getenv("SLOTS") == "1"
+sb = lambda i: ", s1" if SLOTS and i >= 2 else ""
+pairs = ([(i, j) for i in (0, 1) for j in (0, 1)] + [(i, j) for i in range(4) for j in range(4) if i >= 2 or j >= 2]) if SLOTS else \
+        [(i, j) for i in range(4) for j in range(4)]
+body = "\n".join([f"load2 r{AFRAG[i]}, 1, r{5 + i}{sb(i)}" for i in range(4)] +
+                 [f"load2 r{BFRAG[j]}, 2, r9" + (f", #{8 * j}" if j else "") + sb(j) for j in range(4)] +
+                 [f"mma r{acc(i, j)}, r{AFRAG[i]}, r{BFRAG[j]}, r{acc(i, j)}" for i, j in pairs] +
                  [f"iadd r{5 + i}, r{5 + i}, r11" for i in range(4)] + ["iadd r9, r9, r10"])
 stores = []
 for i in range(4):

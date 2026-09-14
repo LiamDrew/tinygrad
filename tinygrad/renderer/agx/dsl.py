@@ -199,13 +199,22 @@ TG_BARRIER = Inst("barrier", bytes.fromhex("070454610900"), doc="threadgroup_bar
 # accumulators between two pairs (mm_tile16.metal: r15 -> r25 -> r15) rather than accumulating in place; both run at the same speed.
 def mma_c(reg:int) -> int: return ((reg & 0x55) << 1) | ((reg & 0xaa) >> 1)
 MMA = Inst("mma", bytes.fromhex("cf025400000000 00 54402400".replace(" ", "")), (
-  Field("wait", B(2, 1), 1), Field("dst", B(3), 8), Field("a", B(5, 1), 6), Field("live_a", B(5, 7), 1), Field("b", B(6, 1), 6), Field("live_b", B(6, 7), 1), Field("c", B(7), 8),
+  Field("wait1", B(1, 7), 1), Field("wait", B(2, 1), 1), Field("dst", B(3), 8), Field("a", B(5, 1), 6), Field("live_a", B(5, 7), 1), Field("b", B(6, 1), 6), Field("live_b", B(6, 7), 1), Field("c", B(7), 8),
   Field("f8", B(8, 7), 1), Field("f9", B(9, 0), 1), Field("creg", B(9, 1), 1), Field("acc", B(11, 0), 1)),
   doc="dst, dst+1 = (a, a+1) * (b, b+1) [+ (c, c+1)] as 8x8 fragments across the SIMD group")
 def store_off_fields(off:int) -> dict[str, int]:
   assert 0 <= off < (1 << 11), f"store offset {off} does not fit"
   return dict(off0=off & 7, off3=off >> 3)
 def store_off(d:dict[str, int]) -> int: return d["off0"] | d["off3"] << 3
+SCOREBOARD = """Two scoreboard slots, hardware-verified 2026-09-14 by scanning one load against one consumer (extra/agx/probes has no kernel for
+this; the experiments are scratch mem3-mem7.py, reproduced in test_agx.test_scoreboard_slots):
+  - a load names its slot in byte 8 bit 7 of its tail (0 or 1). Byte 9 bits 0 and 3, which Apple also varies, have no effect on waiting.
+  - consumers wait per slot: the six-byte float ALU's tail byte is 0xc0 to wait on slot 0 and 0x80 to wait on slot 1 (0x00/0x20/0x40/0x60/0xa0/
+    0xe0 never wait); addr-family ops (load, store, convert, mma) use byte 2 bit 1 for slot 0 and byte 1 bit 7 for slot 1, independently, so one
+    instruction can wait on both.
+  - a wait covers every outstanding load on that slot (verified to 16 loads), not just one.
+  - with NO wait at all a load still lands after roughly 33-38 issue slots, so the wait is a blocking scoreboard check, not the only path.
+The assembler puts every load on slot 0 and waits there, which is why one waiting consumer has always been enough."""
 LOAD_WAIT_MODEL = """Loads are asynchronous and the synchronization is explicit, in the consumer (hardware-verified, test_agx):
   1. the 6-byte word after a load's 8 address bytes (51 01 00 40 46 00 for a plain scalar load) is the load's tail, not a separate wait: it
      carries the width and the immediate offset (LOAD). An earlier reading called it WAIT.
@@ -381,7 +390,7 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
   if inst is STORE:
     n = count_of(d); return f"store{n if n > 1 else ''} r{d['src']}, {d['slot']}, r{d['areg']}" + (f", #{store_off(d)}" if store_off(d) else "") + \
       "".join(f" ; {n}" for n in ("first", "wait", "killa", "last") if d[n]) + (f" ; fmt {d['fmt']}" if d["fmt"] != 1 else "")
-  if inst is MMA: return f"mma r{d['dst']}, r{d['a']}, r{d['b']}" + (f", r{mma_c(d['c'])}" if d["acc"] else "") + "".join(f" ; {n}" for n in ("wait", "f8", "f9") if d[n])
+  if inst is MMA: return f"mma r{d['dst']}, r{d['a']}, r{d['b']}" + (f", r{mma_c(d['c'])}" if d["acc"] else "") + "".join(f" ; {n}" for n in ("wait", "wait1", "f8", "f9") if d[n])
   if inst is TG_LOAD or inst is TG_STORE:
     r = d["dst"] if inst is TG_LOAD else d["src"]; off = (d["off0"] | d["off1"] << 1) if inst is TG_LOAD else store_off(d)
     n = next((c for c, w in TG_WIDTH.items() if w == (d["w4"], d["w2"])), f"?{d['w4']}{d['w2']}")

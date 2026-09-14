@@ -9,8 +9,8 @@ MAXREG=[0] # highest register named while assembling, declared to the driver in 
 TGMEM=[0]  # threadgroup memory bytes requested by .tgmem
 def reg(tok):
     assert tok[0]=='r'; MAXREG[0]=max(MAXREG[0], int(tok[1:])); return int(tok[1:])
-def i_load_idx(dstreg, slot, areg, first, more_follow, kill=False, count=1, off=0): # kill: areg dies here (dsl.KILL_MODEL); count consecutive dsts
-    return dsl.LOAD.encode(first=int(first), more=int(more_follow), dst=dstreg, slot=slot, areg=areg, killa=int(kill), wcode=dsl.WCODE[count], sb0=1, sb1=1,
+def i_load_idx(dstreg, slot, areg, first, more_follow, kill=False, count=1, off=0, sb=0): # sb: scoreboard slot (dsl.SCOREBOARD), byte 8 bit 7
+    return dsl.LOAD.encode(first=int(first), more=int(more_follow), dst=dstreg, slot=slot, areg=areg, killa=int(kill), wcode=dsl.WCODE[count], sb0=1 | 2 * sb, sb1=1,
                            fmt=6, **dsl.off_fields(off))
 def i_load(dstreg, slot, first, more_follow): return i_load_idx(dstreg, slot, 1, first, more_follow) # buf[t]: the thread index is in r1
 def i_addr(dst, shift, imm=None, breg=None, a=1): # rD = (rA << shift) + imm, or + rB; A defaults to r1, the thread index
@@ -55,7 +55,7 @@ EPILOGUE     = dsl.STOP.encode() # the last store's wait precedes it
 
 def assemble_text(program):
     """Return (text_bytes, N, written slots). Builds preamble(0..0x40) + main + epilogue."""
-    N=0; main=bytearray(); load_i=0; written=set(); seen_mem=False; pending=False; loops=[] # pending: loads issued, nothing waited yet
+    N=0; main=bytearray(); load_i=0; written=set(); seen_mem=False; pending=False; pending1=False; loops=[] # pending: loads issued, nothing waited yet
     main+=dsl.GET_SR.encode(dst=1, sr=dsl.SR["tid.x"])   # thread-index prologue: r1 = thread_position_in_grid.x
     lines=[l.split(';')[0].strip() for l in program.splitlines()]  # ';' comments only ('#'=imm)
     lines=[l for l in lines if l]
@@ -69,12 +69,14 @@ def assemble_text(program):
     total_loads=sum(1 for p in body if p[0].startswith('load')); last_store=max((i for i,p in enumerate(body) if p[0].startswith('store')), default=-1)
     for bi,p in enumerate(body):
         op=p[0]
-        if op in ('load','load2','load4'):              # load[N] rD, slot [, rA [, #off]] : rD..rD+N-1 = buf[slot][rA + off ..]; rA defaults to r1 = t
-            d=reg(p[1]); slot=int(p[2]); N=max(N,slot+1); n=int(op[4:] or 1)
-            off=int(p[4].lstrip('#')) if len(p)>4 else 0
-            main+=i_load_idx(d,slot,reg(p[3]) if len(p)>3 else 1, load_i==0, load_i<total_loads-1, count=n, off=off)
+        if op in ('load','load2','load4'):              # load[N] rD, slot [, rA [, #off]] [, s0|s1] : rD..rD+N-1 = buf[slot][rA + off ..]; rA defaults to r1
+            q=list(p); sb=0
+            if q[-1] in ('s0','s1'): sb=int(q.pop()[1])
+            d=reg(q[1]); slot=int(q[2]); N=max(N,slot+1); n=int(op[4:] or 1)
+            off=int(q[4].lstrip('#')) if len(q)>4 else 0
+            main+=i_load_idx(d,slot,reg(q[3]) if len(q)>3 else 1, load_i==0, load_i<total_loads-1, count=n, off=off, sb=sb)
             for k in range(1, n): reg(f"r{d+k}")
-            load_i+=1; seen_mem=True; pending=True
+            load_i+=1; seen_mem=True; pending=pending or sb==0; pending1=pending1 or sb==1
         elif op=='addr':                                 # addr rD, [rA,] shift, #imm | rB : rD = (rA << shift) + imm | rB  (rA defaults to r1 = t)
             a = reg(p[2]) if len(p) > 4 else 1; sh, b = (int(p[3]), p[4]) if len(p) > 4 else (int(p[2]), p[3])
             if b.startswith('#'): main+=i_addr(reg(p[1]), sh, imm=int(b[1:]), a=a)
@@ -132,9 +134,9 @@ def assemble_text(program):
             pending = inst is dsl.TG_LOAD; seen_mem = True
         elif op=='mma':                                  # mma rD, rA, rB [, rC] : 8x8 simdgroup matrix D = A * B [+ C]; register pairs
             acc = len(p) > 4
-            main+=dsl.MMA.encode(dst=reg(p[1]), a=reg(p[2]), b=reg(p[3]), c=dsl.mma_c(reg(p[4])) if acc else 0, acc=int(acc), creg=int(acc), wait=int(pending))
+            main+=dsl.MMA.encode(dst=reg(p[1]), a=reg(p[2]), b=reg(p[3]), c=dsl.mma_c(reg(p[4])) if acc else 0, acc=int(acc), creg=int(acc), wait=int(pending), wait1=int(pending1))
             for r in p[1:]: reg(f"r{reg(r)+1}")
-            pending=False
+            pending=False; pending1=False
         elif op=='barrier':
             main+=dsl.TG_BARRIER.encode()
         elif op=='wait':                                 # accepted for old kernel text: the wait word is part of LOAD now (dsl.LOAD_WAIT_MODEL)

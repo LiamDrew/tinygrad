@@ -23,6 +23,18 @@ Freezes and hangs are marked. Never emit an instruction whose fields you have no
 - The mma's C operand is consumed unless D = C: after `mma rD, rA, rB, rC` (D != C) the pair rC read back 0 for r14, r16, r20 but survived for
   r4, r8, r24 (unexplained). Accumulate in place or reload C. A and B survive and feed several mmas back to back.
 
+## The memory model (`dsl.SCOREBOARD`)
+- There are exactly **two scoreboard slots**. A load names its slot in **byte 8 bit 7** of its tail. Byte 9 bits 0 and 3, which Apple also
+  varies, have no effect on waiting; byte 8 bit 6 likewise.
+- Consumers choose which slot to wait on: the six-byte float ALU's **tail byte** is `0xc0` for slot 0 and `0x80` for slot 1 (`00 20 40 60 a0 e0`
+  never wait at all); **addr-family** ops (load, store, convert, mma) use **byte 2 bit 1** for slot 0 and **byte 1 bit 7** for slot 1. The two are
+  independent bits, so one instruction can wait on both slots.
+- A wait covers *every* outstanding load on that slot, verified to 16 loads, not just the oldest one.
+- With **no wait at all** a load still lands after roughly 33-38 issue slots. The wait is a blocking scoreboard check, not the only path to the
+  data, which is why the WAR hazard below exists.
+- What this does NOT buy: splitting the matmul's loads across both slots so the first four mmas start early measures 3155.8 us against 3156.6
+  for one slot at N=2048, i.e. nothing. The kernel is matrix-issue bound and starting an mma earlier does not help.
+
 ## Loads, stores, waits (`dsl.LOAD_WAIT_MODEL`)
 - A load or store is 14 bytes: 8 address bytes + a 6-byte tail that MUST directly follow (two loads then two tails read 0). The tail was
   mistaken for a separate "wait" instruction for a week. It holds the vector width (byte 8 bits 1..3: 1->0, 2->4, 3->6, 4->3), the immediate
