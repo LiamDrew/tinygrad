@@ -121,14 +121,20 @@ def assemble_text(program):
             main+=loops[-1][1]
         elif op=='endloop':
             start, _ = loops.pop(); main+=loop_tail(len(main) - start, len(loops))
-        elif op in ('tgload','tgload4','tgstore','tgstore4'):   # tgload[4] rD, rA [, #off] | tgstore[4] rS, rA [, #off] : threadgroup memory, element index in rA
+        elif op in ('tgload','tgload2','tgload4','tgstore','tgstore2','tgstore4'):   # tgload[N] rD, rA [, #off] | tgstore[N] rS, rA [, #off] : threadgroup memory, element index in rA
             inst = dsl.TG_LOAD if op.startswith('tgload') else dsl.TG_STORE
-            off = int(p[3].lstrip('#')) if len(p) > 3 else 0; n = 4 if op.endswith('4') else 1
+            off = int(p[3].lstrip('#')) if len(p) > 3 else 0; n = int(op[-1]) if op[-1].isdigit() else 1
             assert N and TGMEM[0], "threadgroup ops need .buffers and .tgmem first"
-            kw = dict(base=2 * tg_base_words(N), a=reg(p[2]), w4=3 if n == 4 else 0, wait=int(pending), **(dict(off0=off & 1, off1=off >> 1) if inst is dsl.TG_LOAD else dsl.store_off_fields(off)))   # base: uniform register (16-bit units) holding the tg pointer
+            w4, w2 = dsl.TG_WIDTH[n]
+            kw = dict(base=2 * tg_base_words(N), a=reg(p[2]), w4=w4, w2=w2, wait=int(pending), **(dict(off0=off & 1, off1=off >> 1) if inst is dsl.TG_LOAD else dict(s30=3 if n == 1 else 0, **dsl.store_off_fields(off))))   # base: uniform register (16-bit units) holding the tg pointer
             main += inst.encode(dst=reg(p[1]), **kw) if inst is dsl.TG_LOAD else inst.encode(src=reg(p[1]), **kw)
             for k in range(1, n): reg(f"r{reg(p[1])+k}")
             pending = inst is dsl.TG_LOAD; seen_mem = True
+        elif op=='mma':                                  # mma rD, rA, rB [, rC] : 8x8 simdgroup matrix D = A * B [+ C]; register pairs
+            acc = len(p) > 4
+            main+=dsl.MMA.encode(dst=reg(p[1]), a=reg(p[2]), b=reg(p[3]), c=dsl.mma_c(reg(p[4])) if acc else 0, acc=int(acc), creg=int(acc), wait=int(pending))
+            for r in p[1:]: reg(f"r{reg(r)+1}")
+            pending=False
         elif op=='barrier':
             main+=dsl.TG_BARRIER.encode()
         elif op=='wait':                                 # accepted for old kernel text: the wait word is part of LOAD now (dsl.LOAD_WAIT_MODEL)

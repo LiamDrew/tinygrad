@@ -454,6 +454,47 @@ class TestAGX(unittest.TestCase):
     from tinygrad.helpers import Context
     with Context(NOOPT=1): self.assertEqual(Tensor(a).contiguous().realize().sum().item(), sum(a))
 
+  def test_simdgroup_mma(self): # probes/simd: 8x8x8 multiply-accumulate on register pairs; lane layout from frag_elems.metal; sources survive
+    import numpy as np
+    row = lambda t: ((t >> 1) & 3) + 4 * (t >> 4); col = lambda t: 2 * (t & 1) + 4 * ((t >> 3) & 1)
+    def perm(M): return [float(M[row(t), col(t) + k]) for t in range(32) for k in range(2)]
+    def unperm(v):
+      M = np.zeros((8, 8), np.float32)
+      for t in range(32):
+        for k in range(2): M[row(t), col(t) + k] = v[2 * t + k]
+      return M
+    rng = np.random.default_rng(1); A, B, C = (rng.integers(-3, 4, (8, 8)).astype(np.float32) for _ in range(3))
+    x, y = perm(A) + perm(B), perm(C) + [0.0] * 64
+    k = ".buffers 3\naddr r12, r1, 1, #0\nload2 r0, 1, r12\nload2 r2, 1, r12, #64\nload2 r20, 2, r12\n%s\nstore2 r6, 0, r12\n"
+    for body, want in [("mma r6, r0, r2", A @ B), ("mma r6, r0, r2, r20", A @ B + C),
+                       ("load2 r22, 2, r12\nmma r40, r0, r2, r20\nmma r6, r40, r2, r22", (A @ B + C) @ B + C),   # a result feeds the next mma's A; C reloaded (dsl.MMA: C is consumed)
+                       ("mma r20, r0, r2, r20\nmma r20, r0, r2, r20\nior r6, r20, r20\nior r7, r21, r21", 2 * (A @ B) + C),   # in place: D over C, chained
+                       ("mma r8, r0, r2, r20\nmma r6, r0, r2, r8", 2 * (A @ B) + C),   # D as the next C
+                       ("mma r8, r0, r2, r20\nior r6, r2, r2\nior r7, r3, r3", B), ("mma r40, r0, r2, r20\nmma r6, r0, r40", A @ (A @ B + C))]:   # B survives; D as B
+      with self.subTest(body=body.split("\n")[0]):
+        got = unperm(self.run_asm_lanes(k % body, x, y))
+        np.testing.assert_array_equal(got, want)
+
+  def run_asm_lanes(self, src:str, x:list[float], y:list[float]) -> list[float]: # 32 threads in one SIMD group; data0[:64]
+    from tinygrad.runtime import ops_agx, ops_metal
+    from tinygrad import codegen
+    from tinygrad.runtime.support import hcq2
+    from tinygrad.engine import realize
+    for c in (codegen.to_program_cache, hcq2.hcq_compile_cache, hcq2.link_linear_cache, realize.runtime_cache): c.clear()
+    Device[Device.DEFAULT].wait_timeout_ms = 10000.0
+    with patch.object(ops_agx.AGXRenderer, "render", lambda self, uops: src), \
+         patch.object(ops_metal.MetalQueue, "dims", staticmethod(lambda prg: (1, 1, 1, 32, 1, 1))):
+      return (Tensor(x).contiguous().realize() + Tensor(y).contiguous().realize()).tolist()[:64]
+
+  def test_tensor_core_matmul(self): # tinygrad's tensor-core path (tc.metal layout) lowered to mma; small sizes only (registers), see AGXRenderer.tensor_cores
+    import numpy as np
+    from tinygrad.renderer import tc
+    from tinygrad.runtime import ops_agx
+    with patch.object(ops_agx.AGXRenderer, "tensor_cores", tc.metal[:1]):
+      for n in (16, 64):
+        A, B = np.random.default_rng(n).random((n, n), dtype=np.float32), np.random.default_rng(n + 1).random((n, n), dtype=np.float32)
+        with self.subTest(n=n): np.testing.assert_allclose((Tensor(A).contiguous().realize() @ Tensor(B).contiguous().realize()).numpy(), A @ B, rtol=1e-5, atol=1e-4)
+
   def test_two_stores(self): # each store followed by STORE_WAIT; the second overwrites the first
     self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nstore r0, 0\nstore r2, 0\n", 1.5, 2.25), 2.25)
 

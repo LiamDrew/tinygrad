@@ -4,7 +4,7 @@ import ctypes, struct, functools, bisect
 from math import prod
 from tinygrad.helpers import Target
 from tinygrad.device import Compiler
-from tinygrad.renderer import Renderer
+from tinygrad.renderer import Renderer, tc
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.runtime.autogen import metal
@@ -48,6 +48,9 @@ class AGXRenderer(Renderer):
   has_local, has_shared, supports_float4 = True, True, True     # threadgroups, threadgroup memory (tgload/tgstore/barrier), 2/4-wide loads and stores; scalar ALU
   local_max = (1024, 1024, 1024)                                # MetalQueue: global_size = threadgroups, local_size = threads per group
   compiler = AGXCompiler()
+  # float32 8x8x8 simdgroup matrix (dsl.MMA; tc.metal's lane layout is the hardware's). Opt-in (AGX_TC=1): the tensor-core kernels above 64x64 need more
+  # registers than the allocator has (32 accumulators + 18 address ints + fragment pairs); the hand-written kernels in extra/agx are the fast path for now
+  tensor_cores = tc.metal[:1] if __import__('os').getenv('AGX_TC') == '1' else []
   # hardware transcendentals (dsl.TRANS); tinygrad decomposes every float op missing here (SIN: codegen/decomp/transcendental.py). Values unused.
   # SHL/SHR here turn the decompositions' x * 2**n and x // 2**n into shifts (codegen/decomp/op.py gates those rewrites on the renderer's ops).
   # SIN: tinygrad's default decomposition reduces large arguments through 64-bit ints (Payne-Hanek); the fast variant is Cody-Waite in float32
@@ -91,6 +94,7 @@ class AGXRenderer(Renderer):
         # consuming later hides their latency (256 matmul: 131 us vs 430 us with each load right before its consumer). Scalar loads and the rest stay
         # lazy so fully unrolled reduces (128 loads up front) fit in 64 registers.
         if not any(w.op in BOUNDARY for w in uops[pos[u] + 1:first]):
+          if vcount(u) > 1 and any(x.op is Ops.WMMA for x in us): lazy.add(u); emit_at[u] = first; continue   # fragment pairs: whole, at first use (registers)
           if vcount(u) > 1 and early_budget[0] >= vcount(u): early_budget[0] -= vcount(u); continue
           if vcount(u) > 1:
             ats = [min(epos(c) for c in uses.get(x, [])) for x in uses[u]]   # per element INDEX: its first consumer
@@ -133,6 +137,9 @@ class AGXRenderer(Renderer):
     # the register file
     NREGS, COUNTER_MAX = 64, 15
     free = sorted(set(range(NREGS)) - {1})
+    # far bank r64..r125: loads/stores and the mma's C and D reach it (8-bit fields), float ALU, movimm and the mma's A/B do not (dsl.REGISTER_FILE).
+    # tensor-core kernels keep their accumulators there (32 registers), touched only by mma, store2 and the zero init (ishl move)
+    far = list(range(64, 126)); use_far = False   # an in-place far-bank mma (D = C = r80, zero-initialized by ishl) hung the GPU (2026-09-14); not used
     owned:dict[UOp, list[int]] = {}    # registers a value gives back when it dies (aliases of an accumulator own nothing)
     reg:dict[UOp, int] = {}
     # classes: loop counters and special-register reads need r0..r15 (4-bit dst), addr's shifted operand r0..r31 (5-bit), ALU results r0..r63.
@@ -140,7 +147,9 @@ class AGXRenderer(Renderer):
     def alloc(u:UOp, limit:int=NREGS - 1, prefer:int=32) -> int:
       for r in [r for r in free if prefer <= r <= limit] + [r for r in free if r < prefer]:
         free.remove(r); owned.setdefault(u, []).append(r); return r
-      raise RuntimeError(f"AGX renderer: out of registers at {u.op} (need r <= {limit}, {len(free)} free); spilling is not implemented")
+      import collections
+      owners = sorted(collections.Counter(f"{o.op.name}x{len(rs)}" for o, rs in owned.items()).items())
+      raise RuntimeError(f"AGX renderer: out of registers at {u.op} (need r <= {limit}, {len(free)} free; holders {owners}); spilling is not implemented")
     def alloc_int(u:UOp) -> int: return alloc(u, 31, 8)
     def alloc_block(u:UOp, n:int, prefer:int=32) -> int: # n consecutive registers (vector loads/stores; any alignment works on hardware)
       for r in [r for r in free if r >= prefer] + [r for r in free if r < prefer]:
@@ -165,7 +174,7 @@ class AGXRenderer(Renderer):
         d = alloc_scratch(u)
         lines.append(f"movimm r{d}, #0x{int(u.arg) & 0xffffffff:08x}" if is_int(u) else f"movimm r{d}, #{float(u.arg)}")   # weak int consts count
         return d
-      if u.op is Ops.INDEX and vcount(v:=strip(u.src[0])) > 1:   # element k of a vector load
+      if u.op is Ops.INDEX and vcount(v:=strip(u.src[0])) > 1 and v.op in {Ops.LOAD, Ops.WMMA}:   # element k of a vector load or a WMMA result
         k = cval(u.src[1]); assert k is not None
         if v in split:   # its own scalar load, right here
           ix = v.src[0]; base, off = idx_split(ix.src[1]); d = alloc(u); reg[u] = d
@@ -236,7 +245,16 @@ class AGXRenderer(Renderer):
         assert u.dtype.itemsize == 4; local_base[u] = tgmem[0] // 4; tgmem[0] += u.arg.size * 4
       elif u.op is Ops.BUFFER:                                  # register-resident accumulators: one register per element
         assert u.arg.addrspace is AddrSpace.REG, f"{u.arg.addrspace} buffers are not implemented"
-        acc_regs[u] = [alloc(u) for _ in range(u.arg.size)]
+        # elements a WMMA reads together as its C pair (tinygrad stacks k and k+4) get adjacent registers, so the mma accumulates in place
+        pairs = {cval(w.src[2].src[0].src[0].src[1]): cval(w.src[2].src[0].src[1].src[0].src[1]) if False else cval(w.src[2].src[1].src[0].src[1])
+                 for w in uops if w.op is Ops.WMMA and strip(w.src[2]).op is Ops.STACK and all(x.op is Ops.LOAD and strip(x.src[0].src[0]) is u for x in strip(w.src[2]).src)}
+        order:list[int] = []
+        for e in range(u.arg.size):
+          if e in order: continue
+          order += [e, pairs[e]] if e in pairs and pairs[e] not in order else [e]
+        try: base = alloc_block(u, u.arg.size); regs = [base + k for k in range(u.arg.size)]
+        except RuntimeError: regs = [alloc(u) for _ in range(u.arg.size)]
+        acc_regs[u] = [regs[order.index(e)] for e in range(u.arg.size)]
       elif u.op is Ops.RANGE:
         n = cval(u.src[0]); assert n is not None, "symbolic loop bounds are not supported yet"
         c = alloc_low(u)
@@ -258,7 +276,9 @@ class AGXRenderer(Renderer):
           base, off = idx_split(ix.src[1]); lines.append(f"tgstore r{val(v)}, r{base}, #{off + local_base[lb]}")
         elif (acc:=acc_of(u)) is not None:                      # accumulator write
           ra = acc_reg(*acc)
-          if cval(v) is not None: lines.append(f"movimm r{ra}, #{float(cval(v)) if dtypes.is_float(v.dtype) else '0x%08x' % (int(cval(v)) & 0xffffffff)}")
+          if cval(v) is not None and ra >= 64:   # far-bank accumulator init: movimm cannot reach it; shift-move from a low register
+            z = alloc_scratch(v); lines.append(f"movimm r{z}, #{float(cval(v)) if dtypes.is_float(v.dtype) else '0x%08x' % (int(cval(v)) & 0xffffffff)}"); lines.append(f"ishl r{ra}, r{z}, #0")
+          elif cval(v) is not None: lines.append(f"movimm r{ra}, #{float(cval(v)) if dtypes.is_float(v.dtype) else '0x%08x' % (int(cval(v)) & 0xffffffff)}")
           elif (rv:=val(v)) != ra: lines.append(f"ior r{ra}, r{rv}, r{rv}")   # register move (bitwise, any 32-bit type)
         else:
           assert v.dtype.itemsize == 4, f"only 32-bit stores for now, not {v.dtype} (float16/bfloat16 are not supported: dsl.DTYPES)"
@@ -295,6 +315,14 @@ class AGXRenderer(Renderer):
         ra = val(u.src[0]); d = alloc(u); reg[u] = d
         if u.op is Ops.SQRT: lines.append(f"rsqrts r{d}, r{ra}"); lines.append(f"fmul r{d}, r{ra}, r{d}")
         else: lines.append(f"{ {Ops.EXP2: 'exp2', Ops.LOG2: 'log2', Ops.RECIPROCAL: 'rcp'}[u.op] } r{d}, r{ra}")
+      elif u.op is Ops.WMMA:                                    # 8x8x8 simdgroup matrix: register pairs; accumulate in place when C is a register pair
+        a, b, c = u.src
+        ra, rb = val(a), val(b); assert vregs[strip(a)][1] == ra + 1 and vregs[strip(b)][1] == rb + 1, "WMMA operands must be register pairs"
+        cs = [val(x) for x in strip(c).src] if strip(c).op is Ops.STACK else vregs[strip(c)]
+        if cs[1] != cs[0] + 1:   # move C into a fresh pair (int moves keep the bits)
+          d = alloc_block(u, 2); lines.append(f"ior r{d}, r{cs[0]}, r{cs[0]}"); lines.append(f"ior r{d + 1}, r{cs[1]}, r{cs[1]}"); cs = [d, d + 1]
+        d = cs[0]   # D = A*B + C written over C: the accumulator's own registers when C is a STACK of accumulator elements (tinygrad's TC kernels)
+        lines.append(f"mma r{d}, r{ra}, r{rb}, r{cs[0]}"); vregs[u] = [d, d + 1]; reg[u] = d
       elif u.op is Ops.BARRIER: lines.append("barrier")
       elif u.op is Ops.IF: lines.append(f"if r{val(u.src[0])}")     # per-thread predication of the region up to ENDIF
       elif u.op is Ops.ENDIF: lines.append("endif")
@@ -310,6 +338,10 @@ class AGXRenderer(Renderer):
         ra, n = val(u.src[0]), cval(u.src[1])
         cnt = f"#{n}" if n is not None and 0 <= n < 32 else f"r{val(u.src[1])}"
         d = alloc_int(u); reg[u] = d; lines.append(f"{mn} r{d}, r{ra}, {cnt}")
+      elif u.op in {Ops.CMOD, Ops.CDIV} and is_int(u) and (n:=cval(u.src[1])) is not None and n > 0 and n & (n - 1) == 0 and u.src[0].vmin >= 0:
+        ra = val(u.src[0]); d = alloc_int(u); reg[u] = d   # power-of-two mod/div of a non-negative int (the tensor-core kernels' lane decomposition)
+        if u.op is Ops.CDIV: lines.append(f"ushr r{d}, r{ra}, #{n.bit_length() - 1}")
+        else: m = alloc_scratch(u); lines.append(f"movimm r{m}, #0x{n - 1:08x}"); lines.append(f"iand r{d}, r{ra}, r{m}")
       elif u.op is Ops.NEG and is_int(u):
         ra = val(u.src[0]); d = alloc_int(u); reg[u] = d; lines.append(f"ineg r{d}, r{ra}")
       elif u.op is Ops.WHERE and u.dtype.itemsize == 4:         # select of 32-bit values (int or float alike: the select moves bits)

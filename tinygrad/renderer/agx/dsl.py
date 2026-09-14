@@ -76,7 +76,10 @@ REGISTER_FILE = """128 32-bit registers, r0..r127 (hardware-verified 2026-09-14,
   - HAZARD: r126 and r127. As the first kernel of a process a load into either returns 0 or stale data (they worked only after a
     warm-up kernel; declaring 132 registers did not help). The display froze minutes after those runs, the project's second freeze,
     the first being an undeclared register count (asm.gen_metadata). Never emit r126 or r127. Apple's largest observed count is 96.
-  - the metadata register count (fn.f0) must cover every register named; Apple writes max register + 1..+7; we declare min(128, 2*(max+1))."""
+  - the metadata register count (fn.f0) must cover every register named; Apple writes max register + 1..+7; we declare max + one 8-block.
+  - far bank r64..r125: loads, stores, shifts (7-bit dst) and the mma's C and D fields reach it; float ALU, movimm and the mma's A/B (bit 7 of their
+    byte is a flag: r70 read as 0) do not. An in-place mma with D = C = r80 (pair zero-initialized by ishl) HUNG the GPU (2026-09-14, recovered by the
+    device timeout); D = r80 with C = r84 had worked. Not used by the renderer."""
 
 # ---- the table --------------------------------------------------------------------------------------------------------------------
 
@@ -166,15 +169,34 @@ STORE_IDX = STORE # old name
 # load 44 0d 00 c0 08 00 (4-wide: 5c 0d), store 44 02 00 30 02 00; the load's element offset sits like a device load's (s[t + 8] -> byte 10 = 04).
 # The barrier is the 6-byte 07 04 54 61 09 00 (present exactly when the source has threadgroup_barrier). The allocation size is metadata fn field 28
 # (bytes: s[64] -> 256, s[1024] -> 4096).
+# widths (probes/tg): 1-wide tail byte 8 = 44, 2-wide 64 (bit 5), 4-wide 5c (bits 3, 4); a wide store also clears byte 11's 0x30 (5c 02 00 00 02 00).
+TG_WIDTH = {1: (0, 0), 2: (0, 1), 4: (3, 0)}   # count -> (w4, w2)
 TG_LOAD = Inst("tgload", bytes.fromhex("6702540000000000 440d00c00800".replace(" ", "")), (
   Field("wait", B(2, 1), 1), Field("dst", B(3, 1), 7), Field("base", B(4), 8), Field("a", B(5, 2), 6), Field("killa", B(6, 7), 1),
-  Field("w4", B(8, 3), 2), Field("off0", B(9, 7), 1), Field("off1", B(10), 8)),
-  doc="dst[..count] = threadgroup[(a + off) * 4 ..]; w4 = 3 for a 4-wide load (Apple: 5c)")
-TG_STORE = Inst("tgstore", bytes.fromhex("e702540000000000 440200300200".replace(" ", "")), (
+  Field("w4", B(8, 3), 2), Field("w2", B(8, 5), 1), Field("off0", B(9, 7), 1), Field("off1", B(10), 8)),
+  doc="dst[..count] = threadgroup[(a + off) * 4 ..]")
+TG_STORE = Inst("tgstore", bytes.fromhex("e702540000000000 440200000200".replace(" ", "")), (
   Field("wait", B(2, 1), 1), Field("src", B(3, 1), 7), Field("base", B(4), 8), Field("a", B(5, 2), 6), Field("killa", B(6, 7), 1),
-  Field("w4", B(8, 3), 2), Field("off0", B(9, 5), 3), Field("off3", B(10), 8)),
-  doc="threadgroup[(a + off) * 4 ..] = src[..count]; offset laid out like a device store's (hardware-verified: +1, +2, +8)")
+  Field("w4", B(8, 3), 2), Field("w2", B(8, 5), 1), Field("off0", B(9, 5), 3), Field("off3", B(10), 8), Field("s30", B(11, 4), 2)),
+  doc="threadgroup[(a + off) * 4 ..] = src[..count]; offset laid out like a device store's (hardware-verified: +1, +2, +8); s30 = 3 on 1-wide stores")
 TG_BARRIER = Inst("barrier", bytes.fromhex("070454610900"), doc="threadgroup_barrier(mem_threadgroup)")
+# simdgroup matrix multiply-accumulate (probes/simd, hardware-verified 2026-09-14 against numpy with moved registers and re-reads): D(8x8) = A * B [+ C],
+# one 12-byte instruction per 8x8x8 (a 16x16x16 product compiles to eight). Each of the 32 lanes holds two consecutive elements of one row in a
+# register pair: lane t has row ((t>>1)&3) + 4*(t>>4), columns 2*(t&1) + 4*((t>>3)&1) .. +1 (frag_elems.metal; tinygrad's tc.metal swizzle is this
+# layout). Three different register encodings in one instruction: dst byte 3 = register number, A byte 5 and B byte 6 = register << 1, C byte 7 =
+# register with each adjacent bit pair swapped (r4 -> 08, r6 -> 09, r8 -> 04, r20 -> 28; found by stepping the field against loaded candidates).
+# byte 11 bit 0 = accumulate C (alone it suffices); byte 9 bit 1 = C is a register (clear: the C byte reads as a small immediate, 08 -> +0.125).
+# byte 8 bit 7 and byte 9 bit 0 are set in Apple's code on last uses but did not zero A or B when tested; left as flags we never set. Apple's
+# kernels vary byte 1's high nibble / byte 2 bit 0 / byte 6 bit 0 for some register choices (undecoded; they are not C's high bits); r0..r46 verified.
+# C IS CONSUMED unless D = C: after `mma rD, rA, rB, rC` with D != C the pair rC read back as 0 for r14, r16, r20 (a later mma using it added
+# nothing) but survived for r4, r8, r24 (unexplained). Accumulate in place (D = C), which is verified for every register tried, or reload C.
+# A and B survive and can feed several mmas back to back (the hand-written matmuls in extra/agx do this). Apple's compiler ping-pongs
+# accumulators between two pairs (mm_tile16.metal: r15 -> r25 -> r15) rather than accumulating in place; both run at the same speed.
+def mma_c(reg:int) -> int: return ((reg & 0x55) << 1) | ((reg & 0xaa) >> 1)
+MMA = Inst("mma", bytes.fromhex("cf025400000000 00 54402400".replace(" ", "")), (
+  Field("wait", B(2, 1), 1), Field("dst", B(3), 8), Field("a", B(5, 1), 7), Field("b", B(6, 1), 7), Field("c", B(7), 8),
+  Field("f8", B(8, 7), 1), Field("f9", B(9, 0), 1), Field("creg", B(9, 1), 1), Field("acc", B(11, 0), 1)),
+  doc="dst, dst+1 = (a, a+1) * (b, b+1) [+ (c, c+1)] as 8x8 fragments across the SIMD group")
 def store_off_fields(off:int) -> dict[str, int]:
   assert 0 <= off < (1 << 11), f"store offset {off} does not fit"
   return dict(off0=off & 7, off3=off >> 3)
@@ -329,7 +351,7 @@ SR = {"tid.x": 0xa0, "tid.y": 0xa1, "tid.z": 0xa2, "gid.x": 0x9c, "gid.y": 0x9d,
 GET_SR = Inst("getsr", bytes.fromhex("0c001006"), (Field("dst", B(0, 4), 4), Field("sr", B(1), 8)), doc="dst = special register (dst nibble only: r0..r15)")
 GET_TID = GET_SR # old name; the prologue reads tid.x into r1
 
-TABLE = (LOAD, TG_LOAD, TG_STORE, TG_BARRIER, IF_BEGIN, IF_END, FMAX, FMIN, I2F, U2F, F2I, F2U, RCP, RSQRT, RSQRTS, EXP2, LOG2, SHL_IMM, LSHR_IMM, ASHR_IMM, SHL_REG, LSHR_REG, ASHR_REG, IADD, ISUB, INEG, IMUL_RR, IAND, IOR, IXOR, IMAX, IMIN, ISEL4, ISEL, ICMP, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STOP, NOP)
+TABLE = (LOAD, TG_LOAD, TG_STORE, TG_BARRIER, MMA, IF_BEGIN, IF_END, FMAX, FMIN, I2F, U2F, F2I, F2U, RCP, RSQRT, RSQRTS, EXP2, LOG2, SHL_IMM, LSHR_IMM, ASHR_IMM, SHL_REG, LSHR_REG, ASHR_REG, IADD, ISUB, INEG, IMUL_RR, IAND, IOR, IXOR, IMAX, IMIN, ISEL4, ISEL, ICMP, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STOP, NOP)
 
 def movimm_bits_fields(v:int) -> dict[str, int]: return {n: (v >> lo) & ((1 << w) - 1) for n, lo, w in _MOVIMM_SLICES}
 def movimm_fields(f:float) -> dict[str, int]: return movimm_bits_fields(struct.unpack("<I", struct.pack("<f", f))[0])
@@ -354,9 +376,11 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
   if inst is STORE:
     n = count_of(d); return f"store{n if n > 1 else ''} r{d['src']}, {d['slot']}, r{d['areg']}" + (f", #{store_off(d)}" if store_off(d) else "") + \
       "".join(f" ; {n}" for n in ("first", "wait", "killa", "last") if d[n]) + (f" ; fmt {d['fmt']}" if d["fmt"] != 1 else "")
+  if inst is MMA: return f"mma r{d['dst']}, r{d['a']}, r{d['b']}" + (f", r{mma_c(d['c'])}" if d["acc"] else "") + "".join(f" ; {n}" for n in ("wait", "f8", "f9") if d[n])
   if inst is TG_LOAD or inst is TG_STORE:
     r = d["dst"] if inst is TG_LOAD else d["src"]; off = (d["off0"] | d["off1"] << 1) if inst is TG_LOAD else store_off(d)
-    return f"{inst.mnemonic}{4 if d['w4'] == 3 else ''} r{r}, r{d['a']}" + (f", #{off}" if off else "") + "".join(f" ; {n}" for n in ("wait", "killa") if d[n]) + (f" ; base {d['base']:02x}" if d["base"] != 8 else "")
+    n = next((c for c, w in TG_WIDTH.items() if w == (d["w4"], d["w2"])), f"?{d['w4']}{d['w2']}")
+    return f"{inst.mnemonic}{n if n != 1 else ''} r{r}, r{d['a']}" + (f", #{off}" if off else "") + "".join(f" ; {n}" for n in ("wait", "killa") if d[n]) + (f" ; base {d['base']:02x}" if d["base"] != 8 else "")
   if inst is FALU or inst is FALU_LONG:
     op, dst, a = "fmul" if d["mul"] else "fadd", f"r{dst_reg(d)}", f"r{operand_reg(d['srca'])}"
     flags = "".join(f" ; {n}" for n in ("killa", "killb", "fwd") if d[n]) + (f" ; tag {d['tag']:02x}" if inst is FALU_LONG and d["tag"] != 0xc0 else "")
