@@ -78,18 +78,22 @@ Freezes and hangs are marked. Never emit an instruction whose fields you have no
 - One 12-byte instruction per 8x8x8 fp32 product (a 16x16x16 compiles to eight). Three register encodings in ONE instruction: D = register number,
   A/B = register << 1, C = register with adjacent bit pairs swapped (r4 -> 08, r6 -> 09, r8 -> 04, r20 -> 28). byte 11 bit 0 = accumulate.
 - Lane layout: lane t holds row ((t>>1)&3) + 4*(t>>4), columns 2*(t&1) + 4*((t>>3)&1) as a register pair. Same as tinygrad's `tc.metal` swizzle.
-- Hand-written kernels live in `extra/agx/mm_hand.py` (16x16 tile per SIMD group, no staging), `mm_staged.py` (32x32 tile per threadgroup of
-  4 SIMD groups, A 32x16 / B 16x32 staged through threadgroup memory) and `mm_staged64.py` (64x64 tile, 16 accumulator pairs per thread).
+- Hand-written kernels: `extra/agx/mm_direct.py` (the fast one: no threadgroup memory at all, 4 SIMD groups, 32x32 tile of C per SIMD group in
+  16 accumulator pairs, four A and four B fragments loaded straight from device memory per K step of 8, 4x4 outer product = 8 loads -> 16 mmas),
+  `mm_hand.py` (16x16 tile per SIMD group, no staging), `mm_staged.py` and `mm_staged64.py` (tiles staged through threadgroup memory).
+- The shape is the whole game. Staging through threadgroup memory LOSES: the kernel that matches Metal has no barriers and lets the cache do the
+  reuse, exactly like Apple's own compiled kernel (scratch mm_metal_1024.dis). What matters is accumulators per thread (32) and reusing each
+  loaded fragment four times.
 - Timings, minimum over 20 runs of one process at a time (fp32, us):
 
-  | N    | mm_hand | mm_staged | mm_staged64 | stock tinygrad on Metal |
-  |------|---------|-----------|-------------|-------------------------|
-  | 1024 | 491     | 2119      | 476         | 431                     |
-  | 2048 | 4463    | -         | 4103        | 3154                    |
+  | N    | mm_direct | mm_hand | mm_staged | mm_staged64 | stock tinygrad on Metal |
+  |------|-----------|---------|-----------|-------------|-------------------------|
+  | 1024 | 436       | 491     | 2119      | 476         | 431                     |
+  | 2048 | 3156      | 4463    | -         | 4103        | 3196 (median 3834)      |
 
-  Metal's own kernel is still 10-30% ahead. Accumulators per thread dominate: the 64x64 tile (32 accumulator registers) beats the 32x32 tile
-  (8 registers) by 4x, and staging only pays once the tile is large enough to reuse what was staged. An earlier reading that a hand kernel
-  matched Apple's compiler and beat Metal came from single 512 runs and did not survive the measurement protocol below.
+  mm_direct matches Metal: 1.2% behind at 1024, level at 2048 and with a far tighter median (3159 vs 3834). It uses NO scoreboard slots and NO
+  kill bits, so both of those remain untapped headroom. An earlier reading that a hand kernel matched Apple's compiler and beat Metal at N=512
+  came from single runs and did not survive the measurement protocol below.
 - Switching a loop from an immediate count to a register count (same iteration count) took the 1024 unstaged kernel from 624 to 491 us,
   reproducibly. Unexplained; possibly the immediate form's `extra` bit path.
 
