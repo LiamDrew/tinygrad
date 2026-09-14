@@ -5,8 +5,9 @@ from tinygrad.runtime.support.agx import air
 
 from tinygrad.renderer.agx import dsl
 
+MAXREG=[0] # highest register named while assembling, declared to the driver in the metadata
 def reg(tok):
-    assert tok[0]=='r'; return int(tok[1:])
+    assert tok[0]=='r'; MAXREG[0]=max(MAXREG[0], int(tok[1:])); return int(tok[1:])
 def i_load(dstreg, slot, first, more_follow): return dsl.LOAD.encode(first=int(first), more=int(more_follow), dst=dstreg, slot=slot)
 def i_load_idx(dstreg, slot, areg, first, more_follow): return dsl.LOAD_IDX.encode(first=int(first), more=int(more_follow), dst=dstreg, slot=slot, areg=areg)
 def i_addr(dst, shift, imm=None, breg=None, a=1): # rD = (rA << shift) + imm, or + rB; A defaults to r1, the thread index
@@ -17,12 +18,12 @@ def i_store_idx(srcreg, slot, areg, first=False, wait=False, last=False):
     return dsl.STORE_IDX.encode(first=int(first), wait=int(wait), src=srcreg, slot=slot, areg=areg, last=int(last)) + dsl.STORE_WAIT.encode()
 def i_imul(dst, stride): return dsl.IMUL.encode(dst=dst, stride=stride)
 def i_wait(): return dsl.WAIT.encode()
-def loop_head(c, n): # init and the increment/compare/enter block. between them the assembler puts the `pre` section (counter = 0..n-1)
+def loop_head(c, n, depth): # init and the increment/compare/enter block. between them the assembler puts the `pre` section (counter = 0..n-1)
     assert n >= 2, "loop counts below 2 hang the GPU"
-    inc = dsl.LOOP_INC.encode(dst=c, step=1, src=c) + dsl.LOOP_CMP.encode(src=dsl.reg_operand(c), n=n >> 1) + dsl.NOP.encode() + dsl.LOOP_ENTER.encode(extra=n & 1)
+    inc = dsl.LOOP_INC.encode(dst=c, step=1, src=c) + dsl.LOOP_CMP.encode(depth2=2 * depth, src=dsl.reg_operand(c), n=n >> 1) + dsl.NOP.encode() + dsl.LOOP_ENTER.encode(extra=n & 1)
     return dsl.LOOP_INIT.encode(dst=c), inc
-def loop_tail(back): # back: bytes from the increment to here
-    return dsl.LOOP_TAIL.encode() + dsl.BRANCH.encode(off=(-(back + dsl.LOOP_TAIL.size)) & 0xffffffffff) + dsl.LOOP_EXIT.encode()
+def loop_tail(back, depth): # back: bytes from the increment to here
+    return dsl.LOOP_TAIL.encode(depth4=8 + depth) + dsl.BRANCH.encode(off=(-(back + dsl.LOOP_TAIL.size)) & 0xffffffffff) + dsl.LOOP_EXIT.encode()
 def i_falu_imm(dst,a,imm,mul=0,wait=True): # an immediate needs the six-byte form (byte4 bit7); tail c0 only when waiting for loads
     b,neg=dsl.e4m3(imm)
     return dsl.FALU_LONG.encode(dst=dst, srcb=b, mul=mul, killb=int(neg), killa=1, srca=dsl.reg_operand(a), ext=0x80, tag=0xc0 if wait else 0x00) # Apple: 00 in loop bodies
@@ -73,12 +74,12 @@ def assemble_text(program):
         elif op=='imul':                                 # imul rD, #stride : rD = t * stride
             main+=i_imul(reg(p[1]), int(p[2].lstrip('#')))
         elif op=='loop':                                 # loop rC, #n [pre] body [post] endloop
-            init, inc = loop_head(reg(p[1]), int(p[2].lstrip('#')))  # pre: ALU-only, sees rC = 0..n-1 (Apple's layout); post: the rest, rC = 1..n
+            init, inc = loop_head(reg(p[1]), int(p[2].lstrip('#')), len(loops))  # pre: ALU-only, sees rC = 0..n-1 (Apple's layout); post: the rest, rC = 1..n
             main+=init; loops.append((len(main), inc)); pending=False # loop_init's tail waits for pending loads
         elif op=='body':
             main+=loops[-1][1]
         elif op=='endloop':
-            start, _ = loops.pop(); main+=loop_tail(len(main) - start)
+            start, _ = loops.pop(); main+=loop_tail(len(main) - start, len(loops))
         elif op=='wait':
             main+=i_wait()
         elif op in ('fadd','fmul'):
@@ -138,15 +139,17 @@ def flatbuffer(objs, root):
         out[base:base + len(body)] = body
     return bytes(out)
 
-def gen_metadata(N, written=None):
+def gen_metadata(N, written=None, nregs=2):
     """Metadata for N buffers with an explicit written set (default {N-1}). Every object here is dereferenced by the
-    AGX driver (ProgramBindingRemap segfaults without it); hardware-verified N=1..3."""
+    AGX driver (ProgramBindingRemap segfaults without it); hardware-verified N=1..3.
+    nregs: fn.f0, the register count Apple's compiler writes (2 for an r0-only kernel, 10 for r7, 30 for r23). It was missing
+    here, which the hardware tolerated up to about r14; a kernel touching r24 with it unset froze the machine (2026-09-14)."""
     written = {N - 1} if written is None else written
     spans = [dict(f0=3, f2=2 * N)] + ([dict(f0=6, f2=2, f3=2 * N)] if N % 2 else [])   # uniform-register spans: 2N address words + pad to 4
     o = {'root':   ('tbl', {0: ('ref', 'fn'), 3: ('ref', 'nameh')}),
          'nameh':  ('tbl', {1: ('ref', 'name')}),  'name': ('str', 'agc.main'),
-         'fn':     ('tbl', {2: ('ref', 'spans'), 3: ('u32', 8 * N), 4: ('ref', 'descs'), 13: ('ref', 'zeros'), 26: ('ref', 'cpoolv'),
-                            **{s: ('ref', 'empty') for s in (6, 8, 10, 12, 27)}}),
+         'fn':     ('tbl', {0: ('u32', nregs), 1: ('u32', 4), 2: ('ref', 'spans'), 3: ('u32', 8 * N), 4: ('ref', 'descs'), 13: ('ref', 'zeros'),
+                            26: ('ref', 'cpoolv'), **({32: ('u8', 1)} if nregs > 10 else {}), **{s: ('ref', 'empty') for s in (6, 8, 10, 12, 27)}}),
          'cpoolv': ('vec', ['cpool']),
          'cpool':  ('tbl', {0: ('ref', 'cpools'), 1: ('u8', 3), 2: ('u8', 1), 3: ('u32', 16)}),  'cpools': ('str', 'agc.main.constant_program'),
          'zeros':  ('raw', struct.pack('<I', 8 * N) + bytes(8 * N)),
@@ -269,8 +272,9 @@ def build_archive(new_text, new_md, N):
 
 def build(program):
     """Assemble `program` and return (archive_bytes, N)."""
+    MAXREG[0]=0
     text,N,written=assemble_text(program)
-    md=gen_metadata(N, written)
+    md=gen_metadata(N, written, nregs=(MAXREG[0] + 1) * 2)   # over-declare: Apple's count exceeds max_reg+1 by a little
     return build_archive(text, md, N), N
 
 if __name__=='__main__':

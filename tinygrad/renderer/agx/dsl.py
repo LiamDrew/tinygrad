@@ -101,10 +101,10 @@ LOOP_INIT = Inst("loop_init", bytes.fromhex("0b0020c0"), (Field("dst", B(0, 4), 
 LOOP_INC = Inst("loop_inc", bytes.fromhex("9f01040003000088 1504".replace(" ", "")), (
   Field("dst", B(3, 1), 7), Field("step", B(5, 1), 7), Field("src", B(6, 3), 5)),   # src: counter register << 3 (r3 -> 18, r6 -> 30)
   doc="counter = counter + step")
-LOOP_CMP = Inst("loop_cmp", bytes.fromhex("0a002380"), (Field("src", B(1), 8), Field("n", B(3, 1), 6)),   # src: (reg<<1)|1; bit0 of byte3 ignored
-  doc="compare counter with n (even)")
+LOOP_CMP = Inst("loop_cmp", bytes.fromhex("0a002380"), (Field("depth2", B(0, 4), 4), Field("src", B(1), 8), Field("n", B(3, 1), 6)),
+  doc="compare counter with n (even). src: (reg<<1)|1; bit0 of byte3 ignored; depth2 = 2 * loop nesting depth (probes/mm_shape.metal)")
 LOOP_ENTER = Inst("loop_enter", bytes.fromhex("07020000"), (Field("extra", B(0, 4), 1),), doc="loop control; extra = one more iteration")
-LOOP_TAIL = Inst("loop_tail", bytes.fromhex("8f045422"), doc="loop control before the back branch, constant in every probe")
+LOOP_TAIL = Inst("loop_tail", bytes.fromhex("8f045422"), (Field("depth4", B(3, 2), 6),), doc="loop control before the back branch; byte3 = 0x22 + 4 * nesting depth")
 BRANCH = Inst("branch", bytes.fromhex("0f00540000000000ff00"), (Field("off", B(3), 40),), doc="pc += off (relative to this instruction's address); 10 bytes")
 LOOP_EXIT = Inst("loop_exit", bytes.fromhex("0f0604020000"), doc="after the loop; stores do not land without it")
 STORE_IDX = Inst("store", bytes.fromhex("e700540000802000"), (
@@ -181,7 +181,8 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
   if inst is IMUL: return f"imul r{d['dst']}, #{d['stride']}"
   if inst is LOOP_INIT: return f"loop_init r{d['dst']}"
   if inst is LOOP_INC: return f"loop_inc r{d['dst']}, r{d['src']}, #{d['step']}"
-  if inst is LOOP_CMP: return f"loop_cmp r{d['src'] >> 1}, #{d['n'] << 1}"
+  if inst is LOOP_CMP: return f"loop_cmp r{d['src'] >> 1}, #{d['n'] << 1}" + (f" ; depth {d['depth2'] >> 1}" if d["depth2"] else "")
+  if inst is LOOP_TAIL: return "loop_tail" + (f" ; depth {d['depth4'] - 8}" if d["depth4"] != 8 else "")
   if inst is LOOP_ENTER: return "loop_enter" + (" ; extra" if d["extra"] else "")
   if inst is BRANCH: return f"branch {d['off'] - (1 << 40) if d['off'] >> 39 else d['off']:+d}"
   if inst is STORE: return f"store r{d['src']}, {d['slot']}" + "".join(f" ; {n}" for n in ("first", "wait", "last") if d[n])

@@ -48,6 +48,13 @@ class TestAGX(unittest.TestCase):
     a, b = Tensor([1.5]).contiguous().realize(), Tensor([2.25]).contiguous().realize()
     self.assertEqual((a * b).item(), 3.375)
 
+  def test_matmul(self): # the renderer lowers tinygrad's naive matmul (NOOPT): three loops, indexed loads, fma, indexed store
+    from tinygrad.helpers import Context
+    A = [[float(i * 4 + j) for j in range(4)] for i in range(4)]; B = [[float((i + j) % 3) for j in range(4)] for i in range(4)]
+    with Context(NOOPT=1):
+      got = (Tensor(A).contiguous().realize() @ Tensor(B).contiguous().realize()).tolist()
+    self.assertEqual(got, [[sum(A[i][k] * B[k][j] for k in range(4)) for j in range(4)] for i in range(4)])
+
   def run_asm(self, src:str, a:float, b:float) -> float: # any three-buffer kernel: data0 = f(data1, data2)
     from tinygrad.runtime import ops_agx
     from tinygrad import codegen

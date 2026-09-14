@@ -13,17 +13,16 @@ from tinygrad.runtime.support.hcq2 import encode_submit
 from tinygrad.runtime.support.agx import asm
 from tinygrad.renderer.agx import dsl
 
-# step 2 stub: every kernel is one binary float op over three buffers, data0[t] = data1[t] op data2[t]; the op is read off the UOps
-BINOP_ASM = """
-.buffers 3
-load r0, 1
-wait
-load r2, 2
-wait
-{op} r4, r0, r2
-store r4, 0
-"""
-FLOAT_OPS = {Ops.ADD: "fadd", Ops.MUL: "fmul"}
+# *****************
+# renderer: linear UOps -> our assembly (tinygrad/runtime/support/agx/asm.py syntax). Naive kernels only: NOOPT=1, no SPECIAL, one thread.
+# registers: r1 is the thread index; floats, constants and loop counters take r2..r14 (4-bit destination fields); int address math takes r16+.
+
+def cval(u:UOp): # constant value behind CASTs, or None
+  while u.op is Ops.CAST: u = u.src[0]
+  return u.arg if u.op is Ops.CONST else None
+def base(u:UOp) -> UOp: # look through AFTER to the buffer
+  while u.op is Ops.AFTER: u = u.src[0]
+  return u
 
 class AGXCompiler(Compiler):
   def __init__(self): super().__init__(None) # no disk cache: assembling is instant and a stale binary hides ISA changes
@@ -34,11 +33,92 @@ class AGXRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
   global_max, local_max = None, None
   compiler = AGXCompiler()
+
   def render(self, uops:list[UOp]) -> str:
+    lines, reg, lo, hi = [], {}, 0, 14                         # reg: UOp -> register; lo/hi pools
+    def new_lo():
+      nonlocal lo; lo += 2; assert lo <= 14, "out of low registers"; return lo
+    def new_hi():
+      nonlocal hi; hi += 2; assert hi <= 62, "out of high registers"; return hi
+    uses:dict[UOp, list[UOp]] = {}
+    for u in uops:
+      for src in u.src: uses.setdefault(src, []).append(u)
     params = [u for u in uops if u.op is Ops.PARAM]
-    alus = [u for u in uops if u.op in FLOAT_OPS and u.dtype == dtypes.float]
-    assert len(params) == 3 and len(alus) == 1, f"the stub renders one float add/mul over 3 buffers, got {len(params)} buffers, {[u.op for u in alus]}"
-    return BINOP_ASM.format(op=FLOAT_OPS[alus[0].op])
+    assert [p.arg.slot for p in params] == list(range(len(params))), "buffers must be the call args 0..n-1"
+    lines.append(f".buffers {len(params)}")
+    slot = {p: p.arg.slot for p in params}
+    done:set[UOp] = set()
+
+    def intop(u:UOp) -> int: # int ALU op -> register holding its value, via addr (shift-add). emits code.
+      if u in reg: return reg[u]
+      a, b = u.src[0], u.src[1]
+      if u.op is Ops.MUL and cval(a) is not None: a, b = b, a
+      if u.op is Ops.ADD and cval(a) is not None: a, b = b, a
+      ra = intop(a) if cval(a) is None else None
+      assert ra is not None, f"int op on two constants should have folded: {u}"
+      d = new_hi()
+      if u.op is Ops.MUL:
+        n = cval(b); assert n is not None and n > 0 and n & (n - 1) == 0 and n <= 16, f"only power-of-two strides up to 16 for now, got {n}"
+        lines.append(f"addr r{d}, r{ra}, {n.bit_length() - 1}, #0")
+      elif u.op is Ops.ADD:
+        if cval(b) is not None: lines.append(f"addr r{d}, r{ra}, 0, #{cval(b)}")
+        else: lines.append(f"addr r{d}, r{ra}, 0, r{intop(b)}")
+      else: raise NotImplementedError(f"int {u.op}")
+      reg[u] = d; done.add(u); return d
+
+    def idxreg(idx:UOp) -> int: # register holding an element index (constants go through movimm)
+      if (c:=cval(idx)) is not None:
+        d = new_lo(); lines.append(f"movimm r{d}, #0x{c:08x}"); return d
+      return intop(idx)
+
+    def fsrc(u:UOp) -> str: # float operand: register or E4M3 immediate
+      return f"#{cval(u)}" if cval(u) is not None else f"r{reg[u]}"
+
+    i = 0
+    while i < len(uops):
+      u = uops[i]; i += 1
+      if u in done or u.op in {Ops.PARAM, Ops.CONST, Ops.CAST, Ops.AFTER, Ops.SINK, Ops.NOOP, Ops.INDEX}: continue
+      if u.op is Ops.BUFFER: reg[u] = new_lo()                 # a register-resident accumulator
+      elif u.op is Ops.RANGE:
+        n = cval(u.src[0]); assert n is not None, "symbolic loop bounds are not supported yet"
+        c = new_lo()
+        lines.append(f"loop r{c}, #{n}")
+        # the counter reads 0..n-1 only in the pre section; copy it there so inner loops (where it already reads 1..n) see the 0-based value
+        v = new_hi(); reg[u] = v; lines.append(f"addr r{v}, r{c}, 0, #0")
+        # pre section: every int op inside this loop that depends only on constants, outer values and this counter
+        depth, j = 0, i
+        while j < len(uops) and not (uops[j].op is Ops.END and uops[j].src[1] is u):
+          v = uops[j]; j += 1
+          if v.dtype == dtypes.int and v.op in {Ops.ADD, Ops.MUL} and all(cval(s) is not None or s in reg or s is u for s in v.src): intop(v)
+        lines.append("body")
+      elif u.op is Ops.END: lines.append("endloop")
+      elif u.op is Ops.LOAD:
+        ix = u.src[0]; buf = base(ix.src[0])
+        if buf.op is Ops.BUFFER: reg[u] = reg[buf]              # accumulator read: alias
+        else:
+          d = new_lo(); reg[u] = d
+          lines.append(f"load r{d}, {slot[buf]}, r{idxreg(ix.src[1])}"); lines.append("wait")
+      elif u.op is Ops.STORE:
+        ix, v = u.src[0], u.src[1]; buf = base(ix.src[0])
+        if buf.op is Ops.BUFFER:                               # accumulator write
+          acc = reg[buf]
+          if cval(v) is not None: lines.append(f"movimm r{acc}, #{float(cval(v))}")
+          else: assert reg[v] == acc, "value must have been computed into the accumulator"
+        else: lines.append(f"store r{reg[v]}, {slot[buf]}, r{idxreg(ix.src[1])}")
+      elif u.op in {Ops.ADD, Ops.MUL} and u.dtype == dtypes.float:
+        us = uses.get(u, [])
+        if u.op is Ops.MUL and len(us) == 1 and us[0].op is Ops.ADD and us[0].dtype == dtypes.float: continue   # fused by the ADD below
+        # destination: the accumulator when this value's only use is an accumulator store
+        dst = reg[base(us[0].src[0].src[0])] if len(us) == 1 and us[0].op is Ops.STORE and base(us[0].src[0].src[0]).op is Ops.BUFFER else new_lo()
+        reg[u] = dst
+        a, b = u.src
+        if u.op is Ops.ADD and b.op is Ops.MUL and b.dtype == dtypes.float and len(uses.get(b, [])) == 1 and b not in reg: a, b = b, a
+        if u.op is Ops.ADD and a.op is Ops.MUL and a.dtype == dtypes.float and len(uses.get(a, [])) == 1 and a not in reg:
+          done.add(a); lines.append(f"fma r{dst}, {fsrc(a.src[0])}, r{reg[a.src[1]]}, {fsrc(b)}")   # a*b + c fused
+        else: lines.append(f"{'fadd' if u.op is Ops.ADD else 'fmul'} r{dst}, r{reg[a]}, {fsrc(b)}")
+      elif u.op in {Ops.ADD, Ops.MUL} and u.dtype == dtypes.int: intop(u)
+      else: raise NotImplementedError(f"AGX renderer: {u.op} {u.dtype}")
+    return "\n".join(lines) + "\n"
 
 # *****************
 # in-memory binary archive: Metal's archive loading is path-only, so we hook the lookup and insert our compute object under whatever key it asks
