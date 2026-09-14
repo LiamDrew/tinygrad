@@ -218,6 +218,21 @@ U2F = Inst("u2f", bytes.fromhex("a70756000200 8c20".replace(" ", "")), _CVT, doc
 F2I = Inst("f2i", bytes.fromhex("270756000200 94480300".replace(" ", "")), _CVT, doc="dst = int32(a), truncating toward zero")
 F2U = Inst("f2u", bytes.fromhex("270756000200 94080200".replace(" ", "")), _CVT, doc="dst = uint32(a), truncating")
 CVTS = {"i2f": I2F, "u2f": U2F, "f2i": F2I, "f2u": F2U}
+# transcendentals (probes/trans/*.metal, hardware-verified 2026-09-14 with re-reads of the source): a 10-byte family in the convert layout (7-bit dst in
+# byte 3, source byte 5 << 2, byte 2 = 56 waits for loads). byte 0 bit 7 and byte 1 pick the function: af 00 rcp, af 01 rsqrt, 2f 01 rsqrt_special
+# (returns 1 at 0, so a * rsqrt_special(a) is Apple's fast::sqrt with sqrt(0) = 0; plain rsqrt gives inf there), af 02 exp2, 2f 02 log2. 2f 03 is the
+# last step of Apple's sin (after a range reduction through undecoded ops; SIN uses tinygrad's decomposition). The source's kill bit is byte 6 bit 5
+# (Apple: b0 kills, 92 keeps) except for rcp, where it is bit 4 (10 kills, 02 keeps). byte 6 bit 1 (h) is clear in Apple's killing forms and set in
+# the others; hardware-tested both ways with no effect. Apple's precise 1/x, sqrt and rsqrt are these plus Newton steps through undecoded ops.
+# wait (byte 2 bit 1) and hint (byte 4 bit 0, set by Apple whenever dst != r0; no effect on hardware) are fields so Apple's listings decode; we emit wait only.
+_TR = lambda name, hexs, kill, doc: Inst(name, bytes.fromhex(hexs), (Field("wait", B(2, 1), 1), Field("dst", B(3, 1), 7), Field("hint", B(4, 0), 1), Field("a", B(5, 2), 6),
+                                                                   Field("killa", B(6, kill), 1), Field("h", B(6, 1), 1)), doc=doc)
+RCP    = _TR("rcp",    "af005400020000482000", 4, "dst = 1 / a (hardware approximation)")
+RSQRT  = _TR("rsqrt",  "af015400020090400000", 5, "dst = 1 / sqrt(a); rsqrt(0) = inf")
+RSQRTS = _TR("rsqrts", "2f015400020090400000", 5, "dst = 1 / sqrt(a) with rsqrts(0) = 1: sqrt(a) = a * rsqrts(a) (Apple's fast::sqrt)")
+EXP2   = _TR("exp2",   "af025400020090400000", 5, "dst = 2 ** a")
+LOG2   = _TR("log2",   "2f025400020090400000", 5, "dst = log2(a)")
+TRANS = {i.mnemonic: i for i in (RCP, RSQRT, RSQRTS, EXP2, LOG2)}
 # the 0x0b bitwise family, 10 bytes: FALU-style operands (byte 1 = srcb, byte 3 = srca, dst nibble + DST_HI), byte 2 bits 3,4 = kills. Bytes 2, 4, 5
 # select the function (Apple: and 1f/00 00, or 1f/02 08, xor 1e/02 08 with the kills set); byte 5 is not an operand (moving b left it unchanged).
 _BIT = lambda name, hexs, doc: Inst(name, bytes.fromhex(hexs), (Field("dst", B(0, 4), 4), Field("srcb", B(1), 8), Field("killb", B(2, 3), 1), Field("killa", B(2, 4), 1),
@@ -276,7 +291,7 @@ STORE_WAIT = Inst("store_wait", bytes.fromhex("110000901100"),
   doc="wait for the preceding store. Apple emits one after every store; two stores back to back lose data without it (test_agx)")
 BARRIER = STORE_WAIT # old name
 
-TABLE = (LOAD, IF_BEGIN, IF_END, FMAX, FMIN, I2F, U2F, F2I, F2U, SHL_IMM, LSHR_IMM, ASHR_IMM, SHL_REG, LSHR_REG, ASHR_REG, IADD, ISUB, INEG, IMUL_RR, IAND, IOR, IXOR, IMAX, IMIN, ISEL4, ISEL, ICMP, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
+TABLE = (LOAD, IF_BEGIN, IF_END, FMAX, FMIN, I2F, U2F, F2I, F2U, RCP, RSQRT, RSQRTS, EXP2, LOG2, SHL_IMM, LSHR_IMM, ASHR_IMM, SHL_REG, LSHR_REG, ASHR_REG, IADD, ISUB, INEG, IMUL_RR, IAND, IOR, IXOR, IMAX, IMIN, ISEL4, ISEL, ICMP, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
 
 def movimm_bits_fields(v:int) -> dict[str, int]: return {n: (v >> lo) & ((1 << w) - 1) for n, lo, w in _MOVIMM_SLICES}
 def movimm_fields(f:float) -> dict[str, int]: return movimm_bits_fields(struct.unpack("<I", struct.pack("<f", f))[0])
@@ -310,6 +325,7 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
   if inst is IF_BEGIN: return f"if r{operand_reg(d['cond'])}"
   if inst is GET_SR: return f"getsr r{d['dst']}, " + next((n for n, v in SR.items() if v == d["sr"]), f"#0x{d['sr']:02x}")
   if inst in CVTS.values(): return f"{inst.mnemonic} r{d['dst']}, r{d['a']}" + (" ; killa" if d["killa"] else "")
+  if inst in TRANS.values(): return f"{inst.mnemonic} r{d['dst']}, r{d['a']}" + "".join(f" ; {n}" for n in ("killa", "wait") if d[n])
   if inst in SHIFTS.values(): return f"{inst.mnemonic} r{d['dst']}, r{d['a']}, " + (f"r{d['breg']}" if "breg" in d else f"#{d['n']}") + "".join(f" ; {n}" for n in ("killa", "killb") if d.get(n))
   if inst is IADD: return f"iadd r{d['dst']}, r{d['a']}, r{d['breg']}"
   if inst is ISUB: return f"isub r{d['dst']}, r{d['breg']}, r{d['a']}"

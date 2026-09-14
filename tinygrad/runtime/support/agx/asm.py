@@ -85,6 +85,8 @@ def assemble_text(program):
             main+=dsl.GET_SR.encode(dst=reg(p[1]), sr=dsl.SR[p[2]])
         elif op in dsl.CVTS:                             # i2f|u2f|f2i|f2u rD, rA
             main+=dsl.CVTS[op].encode(dst=reg(p[1]), a=reg(p[2])); pending=False
+        elif op in dsl.TRANS:                            # rcp|rsqrt|rsqrts|exp2|log2 rD, rA (h = Apple's non-killing form)
+            main+=dsl.TRANS[op].encode(dst=reg(p[1]), a=reg(p[2]), h=1, wait=1); pending=False
         elif op in ('ishl','ishr','ushr'):               # ishl|ishr|ushr rD, rA, #n | rB : shift left / arithmetic right / logical right
             if p[3].startswith('#'): main+=dsl.SHIFTS[(op, False)].encode(dst=reg(p[1]), a=reg(p[2]), n=int(p[3][1:]))
             else: main+=dsl.SHIFTS[(op, True)].encode(dst=reg(p[1]), a=reg(p[2]), breg=reg(p[3]))

@@ -1,4 +1,4 @@
-import unittest, struct
+import unittest, struct, math
 from unittest.mock import patch
 from tinygrad import Tensor, Device
 from tinygrad.renderer.agx import dsl
@@ -21,7 +21,9 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
                        ("3905040100c0", "fadd r3, r0, r2"),                                      # keep_inputs: odd dst
                        ("09c9140180c0", "fadd r0, r0, #3 ; killa"),                              # add_const: E4M3 immediate
                        ("6700440400012000", "load r2, 0, r1"), ("e700540800012100", "store r4, 0, r1 ; last"), ("e700560000012000", "store r0, 0, r1 ; wait"),
-                       ("6700440000822000", "load r0, 0, r2 ; killa")]:   # probes/off1.metal: byte5 82 = areg r2 with its kill bit
+                       ("6700440000822000", "load r0, 0, r2 ; killa"),   # probes/off1.metal: byte5 82 = areg r2 with its kill bit
+                       ("af02560002 00b0400000".replace(" ", ""), "exp2 r0, r0 ; killa ; wait"), ("2f02560403009240 0000".replace(" ", ""), "log2 r2, r0 ; wait"),   # probes/trans
+                       ("af00560002001048 2000".replace(" ", ""), "rcp r0, r0 ; killa ; wait"), ("2f01540403109240 0000".replace(" ", ""), "rsqrts r2, r4")]:
       b = bytes.fromhex(hexs)
       inst = next(i for i in dsl.TABLE if i.matches(b))
       self.assertEqual(dsl.fmt(inst, inst.decode(b)), want, hexs)
@@ -51,6 +53,8 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
     self.assertEqual([t for _, _, t in dsl.disassemble(text)][6:-3], ["ishl r4, r0, #5", "ishr r5, r2, #3", "ushr r6, r0, #1", "ishl r7, r0, r2", "ishr r8, r2, r0", "ushr r9, r0, r2"])
     text, _, _ = asm.assemble_text("load r0, 1\nwait\ni2f r4, r0\nu2f r5, r0\nf2i r6, r0\nf2u r22, r0\nstore r4, 0\n")
     self.assertEqual([t for _, _, t in dsl.disassemble(text)][4:-3], ["i2f r4, r0", "u2f r5, r0", "f2i r6, r0", "f2u r22, r0"])
+    text, _, _ = asm.assemble_text("load r0, 1\nwait\nexp2 r4, r0\nlog2 r5, r0\nrcp r6, r0\nrsqrt r7, r0\nrsqrts r22, r0\nstore r4, 0\n")
+    self.assertEqual([t for _, _, t in dsl.disassemble(text)][4:-3], ["exp2 r4, r0 ; wait", "log2 r5, r0 ; wait", "rcp r6, r0 ; wait", "rsqrt r7, r0 ; wait", "rsqrts r22, r0 ; wait"])
     self.assertEqual(body[0][0], "1f01560802001 0a81105".replace(" ", ""))   # verified on hardware: a - b into r4, kill bits clear (Apple: 17)
     self.assertEqual(body[3][0], "7b050701000000800000")                     # and, kill bits clear (07, Apple: 1f)
 
@@ -352,6 +356,40 @@ class TestAGX(unittest.TestCase):
     self.assertEqual(self.run_asm(k % "fma r4, r0, r2, #1.0", 1.5, 2.25), 4.375)
     self.assertEqual(self.run_asm(k % "fma r4, r0, r2, #-3.0", 1.5, 2.25), 0.375)
     self.assertEqual(self.run_asm(k % "fma r4, #2.0, r0, r2", 1.5, 2.25), 5.25)
+
+  def test_transcendentals(self): # probes/trans: one hardware op each, the source re-read afterwards (its kill bit is clear), dst above r15 and src r2
+    k = ".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\n%s\nstore r6, 0\n"
+    for a, b, body, want in [(3.0, 2.0, "exp2 r4, r0\nfadd r6, r4, r0", 11.0), (3.0, 2.0, "exp2 r22, r2\nfadd r6, r22, r2", 6.0), (8.0, 2.0, "log2 r4, r0\nfadd r6, r4, r0", 11.0),
+                             (8.0, 4.0, "rsqrt r4, r2\nfadd r6, r4, r2", 4.5), (8.0, 4.0, "rcp r4, r2\nfadd r6, r4, r2", 4.25), (4.0, 0.0, "rsqrts r4, r0\nfadd r6, r4, r0", 4.5),
+                             (4.0, 0.0, "rsqrts r4, r2\nfmul r6, r4, r2", 0.0), (4.0, 0.0, "rsqrts r4, r2\nstore r4, 0\nfadd r6, r4, r4", 2.0)]:   # rsqrts(0) = 1: sqrt(0) = 0 * 1
+      with self.subTest(a=a, b=b, body=body.split("\n")[0]): self.assertEqual(self.run_asm(k % body, a, b), want)
+    self.assertTrue(math.isnan(self.run_asm(k % "rsqrt r4, r2\nfmul r6, r4, r2", 4.0, 0.0)))   # plain rsqrt(0) = inf, 0 * inf = nan: why sqrt uses rsqrts
+    # Apple's killing forms zero the source (dsl.KILL_MODEL): exp2's byte 6 bit 5, rcp's bit 4
+    self.assertEqual(self.run_asm(k % "raw af 02 56 08 02 00 b0 40 00 00\nfadd r6, r4, r0", 3.0, 2.0), 8.0)
+    self.assertEqual(self.run_asm(k % "raw af 00 56 08 02 08 10 48 20 00\nfadd r6, r4, r2", 8.0, 4.0), 0.25)
+
+  def test_transcendental_tensors(self): # exp2/log2/sqrt/1/x on hardware (1 ulp of numpy), sin through the float32 decomposition, softmax
+    import numpy as np
+    from tinygrad.helpers import Context
+    x = np.concatenate([np.linspace(0.01, 40, 41, dtype=np.float32), np.array([0.0, 1e-3, 1e3, 1e-30, 1e30, 3.0], np.float32)])
+    t = Tensor(x).contiguous().realize()
+    def ulp(got, want): return np.max(np.where(np.isfinite(want) & (want != 0), np.abs(got.astype(np.float64) - want) / np.spacing(np.abs(want)), 0))
+    for ctx in ({"NOOPT": 1}, {}):
+      with Context(**ctx):
+        for name, got, want in [("exp2", t.exp2().numpy(), np.exp2(x)), ("log2", t.log2().numpy(), np.log2(x)), ("sqrt", t.sqrt().numpy(), np.sqrt(x)),
+                                ("recip", (1 / t).numpy(), 1 / x), ("div", (t / (t + 3)).numpy(), x / (x + 3)), ("exp", t.exp().numpy(), np.exp(x)), ("log", t.log().numpy(), np.log(x)),
+                                ("sin", (t - 20).sin().numpy(), np.sin(x.astype(np.float64) - 20).astype(np.float32))]:
+          with self.subTest(op=name, **ctx):
+            if name == "sin": self.assertLess(np.abs(got - want)[np.abs(x - 20) < 4e4].max(), 1e-6)   # ulps blow up near the zeros of sin; Cody-Waite range
+            elif name in ("exp", "log"): self.assertLess(np.max(np.where(np.isfinite(want) & (want != 0), np.abs(got / want - 1), 0)), 1e-5)   # exp2(x * log2 e) loses ulps as x grows
+            else: self.assertLessEqual(ulp(got, want), 1.0, (got, want))
+            keep = np.abs(x - 20) < 4e4 if name == "sin" else np.ones_like(x, bool)   # sin(1e30) is outside the float32 reduction's range
+            np.testing.assert_array_equal(np.isnan(got[keep]), np.isnan(want[keep])); np.testing.assert_array_equal(np.isinf(got[keep]), np.isinf(want[keep]))
+        self.assertEqual((t.sqrt().numpy()[41], (1 / t).numpy()[41]), (0.0, np.inf))   # sqrt(0) = 0, 1/0 = inf
+        A = np.array([[1.0, 2.0, 3.0, 4.0], [-1.0, 0.0, 0.5, 2.5]], np.float32)
+        ref = np.exp(A) / np.exp(A).sum(1, keepdims=True)
+        self.assertLess(np.abs(Tensor(A).contiguous().realize().softmax(axis=1).numpy() - ref).max(), 1e-6)
+    self.assertTrue(np.isnan(Tensor([np.inf, np.nan]).sin().numpy()).all())
 
   def test_two_stores(self): # each store followed by STORE_WAIT; the second overwrites the first
     self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nstore r0, 0\nstore r2, 0\n", 1.5, 2.25), 2.25)

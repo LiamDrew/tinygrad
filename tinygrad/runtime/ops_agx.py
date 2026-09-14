@@ -12,6 +12,7 @@ from tinygrad.runtime.ops_metal import MetalDevice, MetalQueue, checked, to_ns_s
 from tinygrad.runtime.support.hcq2 import encode_submit
 from tinygrad.runtime.support.agx import asm
 from tinygrad.renderer.agx import dsl
+from tinygrad.codegen.decomp.transcendental import xsin
 
 # *****************
 # renderer: linear UOps -> our assembly (tinygrad/runtime/support/agx/asm.py syntax). SPECIAL gidx/lidx read the threadgroup / local index registers.
@@ -43,6 +44,12 @@ class AGXRenderer(Renderer):
   has_local, has_shared, supports_float4 = True, False, False   # threadgroups yes, threadgroup memory not yet, scalar only
   local_max = (1024, 1024, 1024)                                # MetalQueue: global_size = threadgroups, local_size = threads per group
   compiler = AGXCompiler()
+  # hardware transcendentals (dsl.TRANS); tinygrad decomposes every float op missing here (SIN: codegen/decomp/transcendental.py). Values unused.
+  # SHL/SHR here turn the decompositions' x * 2**n and x // 2**n into shifts (codegen/decomp/op.py gates those rewrites on the renderer's ops).
+  # SIN: tinygrad's default decomposition reduces large arguments through 64-bit ints (Payne-Hanek); the fast variant is Cody-Waite in float32
+  # (1 ulp to |x| ~ 4e4, degrading beyond). Apple's hardware sin (probes/trans/sin.metal) is a reduction sequence through undecoded ops.
+  code_for_op = {Ops.EXP2: None, Ops.LOG2: None, Ops.SQRT: None, Ops.RECIPROCAL: None, Ops.SIN: None, Ops.SHL: None, Ops.SHR: None}
+  extra_matcher = PatternMatcher([(UPat(Ops.SIN, dtype=dtypes.float, src=(UPat.var("d"),)), lambda d: xsin(d, fast=True))])
 
   def render(self, uops:list[UOp]) -> str:
     lines:list[str] = []
@@ -84,18 +91,17 @@ class AGXRenderer(Renderer):
     # is live until that loop's END (it is read again next iteration).
     def roots(u:UOp) -> list[UOp]: return [r for s in u.src for r in roots(s)] if u.op in {Ops.INDEX, Ops.AFTER, Ops.NOOP} or is_free(u) else [u]
     end_of = {e.src[1]: e for e in uops if e.op is Ops.END}
+    loops = [(pos[l], pos[e]) for l, e in end_of.items()]
     last:dict[UOp, int] = {}
-    open_loops:list[UOp] = []
     for i, u in enumerate(uops):
-      if u.op is Ops.END: open_loops.pop()
       at = pos[fused[u]] if u in fused else emit_at.get(u, i)   # fused products and lazy loads read their operands later
       for s in u.src:
         for r in roots(s):
           j = at
-          for l in open_loops:
-            if pos[r] < pos[l]: j = max(j, pos[end_of[l]])
+          for ls, le in loops:   # the loops open at the read, not at u's own position (a product defined before a loop can be fused into an add inside it)
+            if ls < at < le and pos[r] < ls: j = max(j, le)
           last[r] = max(last.get(r, -1), j)
-      if u.op is Ops.RANGE: open_loops.append(u); last[u] = pos[end_of[u]]   # the counter lives for the whole loop
+      if u.op is Ops.RANGE: last[u] = pos[end_of[u]]   # the counter lives for the whole loop
     # a LOAD from a register accumulator aliases the accumulator's register: the accumulator must live as long as that value does
     for u in uops:
       if u.op is Ops.LOAD and (b:=strip(u.src[0].src[0])).op is Ops.BUFFER: last[b] = max(last.get(b, -1), last.get(u, pos[u]))
@@ -218,6 +224,10 @@ class AGXRenderer(Renderer):
         ra, rb = val(u.src[0]), val(u.src[1])
         mn = {Ops.CMPLT: "fcmp.lt", Ops.CMPNE: "fcmp.ne", Ops.CMPEQ: "fcmp.eq", Ops.MAX: "fmax"}[u.op]
         d = alloc(u) if u.op is Ops.MAX else alloc_int(u); reg[u] = d; lines.append(f"{mn} r{d}, r{ra}, r{rb}")
+      elif u.op in {Ops.EXP2, Ops.LOG2, Ops.RECIPROCAL, Ops.SQRT} and u.dtype == dtypes.float:   # one hardware op each; sqrt(a) = a * rsqrts(a)
+        ra = val(u.src[0]); d = alloc(u); reg[u] = d
+        if u.op is Ops.SQRT: lines.append(f"rsqrts r{d}, r{ra}"); lines.append(f"fmul r{d}, r{ra}, r{d}")
+        else: lines.append(f"{ {Ops.EXP2: 'exp2', Ops.LOG2: 'log2', Ops.RECIPROCAL: 'rcp'}[u.op] } r{d}, r{ra}")
       elif u.op is Ops.IF: lines.append(f"if r{val(u.src[0])}")     # per-thread predication of the region up to ENDIF
       elif u.op is Ops.ENDIF: lines.append("endif")
       elif u.op is Ops.SPECIAL:                                 # ("g"|"l", axis): threadgroup_position_in_grid / thread_position_in_threadgroup
