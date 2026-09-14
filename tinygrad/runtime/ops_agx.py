@@ -18,15 +18,15 @@ BINOP_ASM = """
 .buffers 3
 load r0, 1
 wait
-load r1, 2
+load r2, 2
 wait
-{op} r2, r0, r1
-store r2, 0
+{op} r4, r0, r2
+store r4, 0
 """
 FLOAT_OPS = {Ops.ADD: "fadd", Ops.MUL: "fmul"}
 
 class AGXCompiler(Compiler):
-  def __init__(self): super().__init__("compile_agx")
+  def __init__(self): super().__init__(None) # no disk cache: assembling is instant and a stale binary hides ISA changes
   def compile(self, src:str) -> bytes: return asm.build(src)[0]
   def disassemble(self, lib:bytes): print(dsl.disasm_str(text_section(split_archive(lib)[0])))
 

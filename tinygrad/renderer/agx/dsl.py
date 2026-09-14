@@ -45,8 +45,11 @@ class Inst:
 def B(byte:int, bit:int=0, width:int=8) -> int: return 8 * byte + bit # bit offset helper: (byte index, bit within byte)
 
 # ---- operand encodings ----------------------------------------------------------------------------------------------------------
-def reg_operand(r:int) -> int: return ((r << 2) | 1) & 0xff # 32-bit register N as a source operand: bits[7:1] = N<<1, bit0 = 32-bit width
-def operand_reg(o:int) -> int: return o >> 2
+# register fields hold the 32-bit register number << 1 (probes/sums_live.metal: loads into fields 00,04,08,0c, sums stored from 10,14,18 with
+# ALU dst nibbles 8,a,c). Apple's compiler prefers even registers. Hardware-verified (test_agx): dst nibble 2/4 <-> store field 2/4.
+# dst-style fields (load dst, store src) sit at bit 1 of their byte and hold the register number directly
+def reg_operand(r:int) -> int: return (r << 1) | 1     # 32-bit source operand: bit0 = 32-bit width
+def operand_reg(o:int) -> int: return o >> 1
 def e4m3(v:float) -> tuple[int, bool]: # unsigned E4M3 minifloat (exponent bias 11) in bits[7:1], bit0 = 32-bit flag; sign rides in the modifier
   if v == 0: raise ValueError("0.0 is not E4M3; use movimm")
   neg, v = v < 0, abs(v)
@@ -59,40 +62,47 @@ def e4m3_value(b:int) -> float:
   return 2.0 ** ((b >> 3) - 11) * (1 + (b & 7) / 8.0)
 
 # ---- the table --------------------------------------------------------------------------------------------------------------------
-FADD_ADD_IMM, FADD_NEG = 0x14, 0x1c # fadd modifier byte: add the immediate / negate-or-register srcB
-STORE_RESULT = 0x54                 # store src byte naming the last fadd result
 
 LOAD = Inst("load", bytes.fromhex("6700440000012000"), (
   Field("first", B(1, 4), 1),       # set on the first load of the kernel
   Field("more", B(2, 4), 1),        # another load follows (scoreboard)
-  Field("dst", B(3, 2), 6),         # destination register
+  Field("dst", B(3, 1), 7),         # destination register (reg_field)
   Field("slot", B(4), 8)),          # dense buffer binding index
   doc="dst = buf[slot][thread_index] (32-bit)")
-STORE = Inst("store", bytes.fromhex("e700000000012100"), (
-  Field("src", B(2), 8),            # 0x54 = fadd result, else 0x56 for r0 or 0x54 + 2*reg
+STORE = Inst("store", bytes.fromhex("e700540000012100"), (
+  Field("first", B(1, 4), 1),       # set when no load preceded (probes/movimm.metal)
+  Field("hint", B(2, 1), 1),        # 0x56 vs 0x54 in byte 2: seen on stores straight from a load, meaning unknown; 0 works everywhere
+  Field("src", B(3, 1), 7),         # source register (reg_field)
   Field("slot", B(4), 8)),
   doc="buf[slot][thread_index] = src (32-bit)")
 WAIT = Inst("wait", bytes.fromhex("510100404600"), doc="wait for one outstanding load")
-FALU = Inst("falu", bytes.fromhex("0900000000c0"), (
+# float ALU. 4-byte minimal form: [09 | dst<<4] [srcb] [mod] [srca]. mod bit2 adds two bytes (byte4 = 0 so far, byte5 in {c0,20,40}:
+# scheduling-looking, undecoded); mod bit1 adds an fma third operand. Verified on hardware in test_agx with explicit and odd dst.
+FALU = Inst("falu", bytes.fromhex("09000000"), (
+  Field("dst", B(0, 4), 4),         # destination register r0..r15 (probes/sums_live.metal)
   Field("srcb", B(1), 8),           # register operand, or E4M3 immediate when bmode has bit 7
-  Field("mul", B(2, 0), 1),         # 0 = fadd, 1 = fmul (probes/fmul.metal vs sum3.metal: the only differing bit)
-  Field("mod", B(2, 1), 7),         # FADD_ADD_IMM / FADD_NEG, stored >> 1
-  Field("srca", B(3), 8),
-  Field("bmode", B(4), 8)),         # 0x80 = srcb is an immediate
-  doc="fadd32/fmul32: result = srca op srcb (result register is implicit for now)")
-FADD = FALU # the assembler's old name
+  Field("mul", B(2, 0), 1),         # 0 = fadd, 1 = fmul (probes/fmul.metal)
+  Field("fma", B(2, 1), 1),         # three-operand form, 8 bytes (probes/mul_add.metal), not encodable here yet
+  Field("killb", B(2, 3), 1),       # srcb dies after this op (compiler hint; every probe agrees, semantics unverified)
+  Field("killa", B(2, 4), 1),       # srca dies after this op
+  Field("fwd", B(2, 5), 1),         # result feeds another ALU op rather than a store
+  Field("srca", B(3), 8)),
+  doc="fadd32/fmul32: dst = srca op srcb. Apple emits this short form, but on hardware a store right after it reads 0: use FALU_LONG")
+FALU_LONG = Inst("falu", bytes.fromhex("090004000000"), tuple(FALU.fields) + (Field("ext", B(4), 8), Field("tag", B(5), 8)),
+  doc="six-byte float ALU: mod bit2 (fixed here) set, byte4 = 0 or 0x80 for an immediate srcb, byte5 = c0/20/40 in Apple's output")
+FALU_IMM_NEG, FALU_IMM_ADD = 1, 0    # for an E4M3 immediate srcb the sign lives in killb: 0x14 = add, 0x1c = negate (prog_add vs probes)
 MOVIMM = Inst("movimm", bytes.fromhex("0c80020000000000"), (
   Field("hi7", B(3, 1), 7),         # fp32 bits[31:25]
   Field("mid21", B(4, 3), 21),      # fp32 bits[20:0]
   Field("lo4", B(7, 0), 4),         # fp32 bits[24:21]
-  Field("dst", B(7, 4), 4)),
+  Field("dst", B(7, 4), 4)),        # destination register (probes/movimm.metal: r0 -> 0; unit unverified beyond r0)
   doc="dst = fp32 immediate")
 NOP = Inst("nop", bytes.fromhex("0600"))
 STOP = Inst("stop", bytes.fromhex("0e000000"))
 GET_TID = Inst("get_tid", bytes.fromhex("1ca01006"), doc="read thread_position_in_grid (prologue)")
 BARRIER = Inst("barrier", bytes.fromhex("110000901100"), doc="end-of-kernel barrier (epilogue, followed by stop)")
 
-TABLE = (LOAD, STORE, WAIT, FALU, MOVIMM, GET_TID, BARRIER, STOP, NOP)
+TABLE = (LOAD, STORE, WAIT, FALU_LONG, FALU, MOVIMM, GET_TID, BARRIER, STOP, NOP)
 
 def movimm_fields(f:float) -> dict[str, int]:
   v = struct.unpack("<I", struct.pack("<f", f))[0]
@@ -103,13 +113,12 @@ def movimm_value(d:dict[str, int]) -> float:
 # ---- disassembler -----------------------------------------------------------------------------------------------------------------
 def fmt(inst:Inst, d:dict[str, int]) -> str:
   if inst is LOAD: return f"load r{d['dst']}, {d['slot']}" + (" ; first" if d["first"] else "") + (" ; more" if d["more"] else "")
-  if inst is STORE:
-    src = "result" if d["src"] == STORE_RESULT else f"r{0 if d['src'] == 0x56 else (d['src'] - STORE_RESULT) // 2}"
-    return f"store {src}, {d['slot']}"
-  if inst is FALU:
-    op, a, mod = "fmul" if d["mul"] else "fadd", f"r{operand_reg(d['srca'])}", d["mod"] << 1
-    if d["bmode"] & 0x80: return f"{op} {a}, #{'-' if mod == FADD_NEG else ''}{e4m3_value(d['srcb']):g}"
-    return f"{op} {a}, r{operand_reg(d['srcb'])}"
+  if inst is STORE: return f"store r{d['src']}, {d['slot']}" + (" ; first" if d["first"] else "") + (" ; hint" if d["hint"] else "")
+  if inst is FALU or inst is FALU_LONG:
+    op, dst, a = "fmul" if d["mul"] else "fadd", f"r{d['dst']}", f"r{operand_reg(d['srca'])}"
+    flags = "".join(f" ; {n}" for n in ("fma", "killa", "killb", "fwd") if d[n]) + (f" ; tag {d['tag']:02x}" if inst is FALU_LONG and d["tag"] != 0xc0 else "")
+    if inst is FALU_LONG and d["ext"] & 0x80: return f"{op} {dst}, {a}, #{'-' if d['killb'] else ''}{e4m3_value(d['srcb']):g}{flags}"
+    return f"{op} {dst}, {a}, r{operand_reg(d['srcb'])}{flags}"
   if inst is MOVIMM: return f"movimm r{d['dst']}, #{movimm_value(d):g}"
   return inst.mnemonic
 

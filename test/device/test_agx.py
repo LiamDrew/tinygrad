@@ -1,28 +1,35 @@
 import unittest
+from unittest.mock import patch
 from tinygrad import Tensor, Device
 from tinygrad.renderer.agx import dsl
 from tinygrad.runtime.support.agx import asm
 
 class TestAGXISA(unittest.TestCase): # no device needed: the table must read back what it writes
   def test_roundtrip(self):
-    src = "load r0, 1\nwait\nload r1, 2\nwait\nfadd r2, r0, r1\nstore r2, 0\n"
+    src = "load r0, 1\nwait\nload r2, 2\nwait\nfadd r4, r0, r2\nstore r4, 0\n"
     text, n, written = asm.assemble_text(src)
     self.assertEqual((n, written), (3, {0}))
     body = [t for _, _, t in dsl.disassemble(text)]
-    self.assertEqual(body, [".preamble 64 bytes", "get_tid", "load r0, 1 ; first ; more", "wait", "load r1, 2", "wait", "fadd r0, r1",
-                            "store result, 0", "barrier", "stop"])
+    self.assertEqual(body, [".preamble 64 bytes", "get_tid", "load r0, 1 ; first ; more", "wait", "load r2, 2", "wait", "fadd r4, r0, r2 ; killa ; killb",
+                            "store r4, 0", "barrier", "stop"])
     self.assertFalse(any(t.startswith(".short") for t in body), "every emitted byte decodes")
 
-  def test_fmul_matches_apple(self): # probes/fmul.metal: Apple's fmul differs from fadd by the low bit of the modifier byte
-    text, _, _ = asm.assemble_text("load r0, 0\nwait\nload r1, 1\nwait\nfmul r2, r0, r1\nstore r2, 2\n")
-    self.assertIn(bytes.fromhex("09051d0100c0"), text) # Apple emits 09 01 1d 05 00 c0: same bit, operands swapped (commutative)
-    self.assertIn("fmul r0, r1", [t for _, _, t in dsl.disassemble(text)])
+  def test_apple_bytes_decode(self): # bytes captured from probes/*.metal
+    for hexs, want in [("09011c05 00c0".replace(" ", ""), "fadd r0, r2, r0 ; killa ; killb"),   # sum3: b2 = b0 + b1
+                       ("09011d0500c0", "fmul r0, r2, r0 ; killa ; killb"),                       # fmul
+                       ("c9110015", "fadd r12, r10, r8"),                                        # sums_live: 4-byte form, explicit dst
+                       ("3905040100c0", "fadd r3, r0, r2"),                                      # keep_inputs: odd dst
+                       ("09c9140180c0", "fadd r0, r0, #3 ; killa"),                              # add_const: E4M3 immediate
+                       ("6700440400012000", "load r2, 0"), ("e70054080001210 0".replace(" ", ""), "store r4, 0")]:
+      b = bytes.fromhex(hexs)
+      inst = next(i for i in dsl.TABLE if i.matches(b))
+      self.assertEqual(dsl.fmt(inst, inst.decode(b)), want, hexs)
 
   def test_immediates(self):
     text, _, _ = asm.assemble_text("movimm r0, #42.0\nfadd r0, r0, #-3.5\nstore r0, 0\n")
     body = [t for _, _, t in dsl.disassemble(text)]
     self.assertIn("movimm r0, #42", body)
-    self.assertIn("fadd r0, #-3.5", body)
+    self.assertIn("fadd r0, r0, #-3.5 ; killa ; killb", body)
 
 @unittest.skipUnless(Device.DEFAULT == "AGX", "AGX device required")
 class TestAGX(unittest.TestCase):
@@ -33,5 +40,28 @@ class TestAGX(unittest.TestCase):
   def test_mul_two_numbers(self):
     a, b = Tensor([1.5]).contiguous().realize(), Tensor([2.25]).contiguous().realize()
     self.assertEqual((a * b).item(), 3.375)
+
+  def run_asm(self, src:str, a:float, b:float) -> float: # any three-buffer kernel: data0 = f(data1, data2)
+    from tinygrad.runtime import ops_agx
+    from tinygrad import codegen
+    from tinygrad.runtime.support import hcq2
+    from tinygrad.engine import realize
+    # every call has the same kernel AST; without this the first compiled program would be reused for all of them
+    for c in (codegen.to_program_cache, hcq2.hcq_compile_cache, hcq2.link_linear_cache, realize.runtime_cache): c.clear()
+    with patch.object(ops_agx.AGXRenderer, "render", lambda self, uops: src):
+      x, y = Tensor([a]).contiguous().realize(), Tensor([b]).contiguous().realize()
+      return (x + y).item() # the op here is irrelevant: render is patched
+
+  def test_dst_register(self): # the destination nibble in byte 0 of the float ALU op, verified on hardware
+    for d in (0, 1, 3, 4, 7, 15):
+      with self.subTest(dst=d):
+        self.assertEqual(self.run_asm(f".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nfadd r{d}, r0, r2\nstore r{d}, 0\n", 1.5, 2.25), 3.75)
+
+  def test_odd_registers(self): # loads and operands numbered in 32-bit registers, odd ones included
+    self.assertEqual(self.run_asm(".buffers 3\nload r1, 1\nwait\nload r3, 2\nwait\nfmul r5, r1, r3\nstore r5, 0\n", 1.5, 2.25), 3.375)
+
+  def test_operand_order(self): # subtraction would tell a from b; with add/mul only, check srca and srcb both read the right registers
+    self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nfadd r4, r2, r0\nstore r4, 0\n", 1.5, 2.25), 3.75)
+    self.assertEqual(self.run_asm(".buffers 3\nload r6, 1\nwait\nload r2, 2\nwait\nfmul r0, r6, r2\nstore r0, 0\n", 1.5, 2.25), 3.375)
 
 if __name__ == "__main__": unittest.main()
