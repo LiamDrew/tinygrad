@@ -26,12 +26,12 @@ def loop_tail(back, depth): # back: bytes from the increment to here
     return dsl.LOOP_TAIL.encode(depth4=8 + depth) + dsl.BRANCH.encode(off=(-(back + dsl.LOOP_TAIL.size)) & 0xffffffffff) + dsl.LOOP_EXIT.encode()
 def i_falu_imm(dst,a,imm,mul=0,wait=True): # an immediate needs the six-byte form (byte4 bit7); tail c0 only when waiting for loads
     b,neg=dsl.e4m3(imm)
-    return dsl.FALU_LONG.encode(dst=dst, srcb=b, mul=mul, killb=int(neg), killa=1, srca=dsl.reg_operand(a), ext=0x80, tag=0xc0 if wait else 0x00) # Apple: 00 in loop bodies
+    return dsl.FALU_LONG.encode(**dsl.dst_fields(dst), srcb=b, mul=mul, killb=int(neg), killa=1, srca=dsl.reg_operand(a), ext=0x80, tag=0xc0 if wait else 0x00) # Apple: 00 in loop bodies
 def i_falu_reg(dst,a,bb,mul=0,wait=True): # waiting (six-byte, tail c0) for the first consumer of loads, else the four-byte form, like Apple
-    if wait: return dsl.FALU_LONG.encode(dst=dst, srcb=dsl.reg_operand(bb), mul=mul, killa=1, killb=1, srca=dsl.reg_operand(a), tag=0xc0)
-    return dsl.FALU.encode(dst=dst, srcb=dsl.reg_operand(bb), mul=mul, killa=1, killb=1, srca=dsl.reg_operand(a))
+    if wait: return dsl.FALU_LONG.encode(**dsl.dst_fields(dst), srcb=dsl.reg_operand(bb), mul=mul, killa=1, killb=1, srca=dsl.reg_operand(a), tag=0xc0)
+    return dsl.FALU.encode(**dsl.dst_fields(dst), srcb=dsl.reg_operand(bb), mul=mul, killa=1, killb=1, srca=dsl.reg_operand(a))
 def i_fma(dst, a, b, c): # fma rD, rA|#imm, rB, rC|#imm|-rC : rD = rA*rB + rC  (always the waiting tail c0)
-    kw = dict(dst=dst, srcb=dsl.reg_operand(b), killa=1, killb=1)
+    kw = dict(**dsl.dst_fields(dst), srcb=dsl.reg_operand(b), killa=1, killb=1)
     if a.startswith('#'): kw.update(srca=dsl.e4m3(float(a[1:]))[0], aimm=1, killa=0)
     else: kw.update(srca=dsl.reg_operand(reg(a)))
     if c.startswith('#'):
@@ -41,8 +41,8 @@ def i_fma(dst, a, b, c): # fma rD, rA|#imm, rB, rC|#imm|-rC : rD = rA*rB + rC  (
     return dsl.FMA.encode(**kw)
 def i_store(srcreg, slot, first=False, wait=False, last=False): # every store is followed by its wait, like Apple
     return dsl.STORE.encode(first=int(first), wait=int(wait), src=srcreg, slot=slot, last=int(last)) + dsl.STORE_WAIT.encode()
-def movimm_bytes(dst, f): return dsl.MOVIMM.encode(dst=dst, **dsl.movimm_fields(f))
-def movimm_bits(dst, v): return dsl.MOVIMM.encode(dst=dst, hi7=v >> 25, mid21=v & 0x1fffff, lo4=(v >> 21) & 0xf)
+def movimm_bytes(dst, f): return dsl.MOVIMM.encode(**dsl.dst_fields(dst), **dsl.movimm_fields(f))
+def movimm_bits(dst, v): return dsl.MOVIMM.encode(**dsl.dst_fields(dst), **dsl.movimm_bits_fields(v))
 
 PREAMBLE_IDX = bytes.fromhex('030007000200000060000e000000')  # thread-index preamble
 EPILOGUE     = dsl.STOP.encode() # the last store's wait precedes it
@@ -274,7 +274,7 @@ def build(program):
     """Assemble `program` and return (archive_bytes, N)."""
     MAXREG[0]=0
     text,N,written=assemble_text(program)
-    md=gen_metadata(N, written, nregs=(MAXREG[0] + 1) * 2)   # over-declare: Apple's count exceeds max_reg+1 by a little
+    md=gen_metadata(N, written, nregs=min(128, (MAXREG[0] + 1) * 2))   # over-declare: Apple writes max_reg+1..+7 (r8 -> 9, r47 -> 50, r63 -> 96); 128 GPRs
     return build_archive(text, md, N), N
 
 if __name__=='__main__':

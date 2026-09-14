@@ -49,6 +49,10 @@ def B(byte:int, bit:int=0, width:int=8) -> int: return 8 * byte + bit # bit offs
 # ALU dst nibbles 8,a,c). Apple's compiler prefers even registers. Hardware-verified (test_agx): dst nibble 2/4 <-> store field 2/4.
 # dst-style fields (load dst, store src) sit at bit 1 of their byte and hold the register number directly
 def reg_operand(r:int) -> int: return (r << 1) | 1     # 32-bit source operand: bit0 = 32-bit width
+def dst_fields(r:int) -> dict[str, int]: # 6-bit ALU destination r0..r63 split into the byte-0 nibble and the mod-byte extension
+  assert 0 <= r < 64, f"ALU destination r{r} out of range (r0..r63)"
+  return dict(dst=r & 0xf, dst_hi=r >> 4)
+def dst_reg(d:dict[str, int]) -> int: return d["dst"] | d.get("dst_hi", 0) << 4
 def operand_reg(o:int) -> int: return o >> 1
 def e4m3(v:float) -> tuple[int, bool]: # unsigned E4M3 minifloat (exponent bias 11) in bits[7:1], bit0 = 32-bit flag; sign rides in the modifier
   if v == 0: raise ValueError("0.0 is not E4M3; use movimm")
@@ -60,6 +64,16 @@ def e4m3(v:float) -> tuple[int, bool]: # unsigned E4M3 minifloat (exponent bias 
 def e4m3_value(b:int) -> float:
   b >>= 1
   return 2.0 ** ((b >> 3) - 11) * (1 + (b & 7) / 8.0)
+
+REGISTER_FILE = """128 32-bit registers, r0..r127 (hardware-verified 2026-09-14, M3):
+  - the prologue leaves the thread index in r1; everything else is free.
+  - float ALU destinations (FALU, FMA, MOVIMM) reach r63: nibble in byte 0 plus DST_HI in the mod byte. Apple's compiler never writes
+    above r63 with these forms and spills instead (probes/live96.metal declares 96 registers, all its fadd destinations are <= r63).
+  - load/store/addr fields are 7 bits; loads into r64..r125 work.
+  - HAZARD: r126 and r127. As the first kernel of a process a load into either returns 0 or stale data (they worked only after a
+    warm-up kernel; declaring 132 registers did not help). The display froze minutes after those runs, the project's second freeze,
+    the first being an undeclared register count (asm.gen_metadata). Never emit r126 or r127. Apple's largest observed count is 96.
+  - the metadata register count (fn.f0) must cover every register named; Apple writes max register + 1..+7; we declare min(128, 2*(max+1))."""
 
 # ---- the table --------------------------------------------------------------------------------------------------------------------
 
@@ -125,8 +139,12 @@ LOAD_WAIT_MODEL = """Loads are asynchronous and the synchronization is explicit,
   3. one waiting consumer covers all outstanding loads: after it, four-byte FALU and 0x54 stores are fine (Apple emits exactly this).
 Apple's later six-byte ops carry tails 00 20 / 00 40; those do not work as the first consumer and are not understood."""
 # float ALU. 4-byte form: [09 | dst<<4] [srcb] [mod] [srca]. mod bit2 adds the two-byte tail (FALU_LONG); mod bit1 adds an fma third operand.
+# destination registers: the 4-bit nibble in byte 0 holds bits [3:0]; bits [5:4] sit in the mod byte's top two bits (probes/live24, live48:
+# fadd r21 = 59 b1 54, r40 = 89 b1 94; Apple never writes above r63 with these forms, even with 96 values live). Same split for MOVIMM.
+DST_HI = Field("dst_hi", B(2, 6), 2)
 FALU = Inst("falu", bytes.fromhex("09000000"), (
-  Field("dst", B(0, 4), 4),         # destination register r0..r15 (probes/sums_live.metal)
+  Field("dst", B(0, 4), 4),         # destination register bits [3:0] (probes/sums_live.metal)
+  DST_HI,
   Field("srcb", B(1), 8),           # register operand, or E4M3 immediate when bmode has bit 7
   Field("mul", B(2, 0), 1),         # 0 = fadd, 1 = fmul (probes/fmul.metal); mod bit1 (fixed 0 here) selects FMA
   Field("killb", B(2, 3), 1),       # srcb dies after this op (compiler hint; every probe agrees, semantics unverified)
@@ -141,7 +159,7 @@ FALU_IMM_NEG, FALU_IMM_ADD = 1, 0    # for an E4M3 immediate srcb the sign lives
 # negated product, immediate srca, and dst != r0. byte4: bit5 = c is an E4M3 immediate, bit4 = negate register c, bit7 = set for a
 # register c or a negated immediate c (probes/mul_add.metal and friends). byte7: bit3 = negate the product, bit1 = srca is an immediate.
 FMA = Inst("fma", bytes.fromhex("090006000100 02c0"), (
-  Field("dst", B(0, 4), 4),
+  Field("dst", B(0, 4), 4), DST_HI,
   Field("srcb", B(1), 8),
   Field("killb", B(2, 3), 1), Field("killa", B(2, 4), 1), Field("fwd", B(2, 5), 1),
   Field("srca", B(3), 8),
@@ -149,12 +167,20 @@ FMA = Inst("fma", bytes.fromhex("090006000100 02c0"), (
   Field("c", B(5), 8),              # register << 1, or E4M3 immediate without its low bit
   Field("negp", B(7, 3), 1), Field("aimm", B(7, 1), 1)),
   doc="dst = srca * srcb + c")
+# 32-bit immediate, scattered (single-bit probes against 42.0 = 0x42280000, 2026-09-14; bits 0..8 come from Apple's 3.14159 encoding ac d0 42 40 1e 04 48 02,
+# the compiler switches to another form when only low bits change). Earlier layout lost bits 0..12: movimm r26, #3.14159 stored 3.1420898.
 MOVIMM = Inst("movimm", bytes.fromhex("0c80020000000000"), (
   Field("dst", B(0, 4), 4),         # destination register, top nibble of byte 0 like the float ALU (probe: two constants -> 2c.., 0c..)
-  Field("hi7", B(3, 1), 7),         # fp32 bits[31:25]
-  Field("mid21", B(4, 3), 21),      # fp32 bits[20:0]
-  Field("lo4", B(7, 0), 4)),        # fp32 bits[24:21]; byte 7's upper nibble is not the destination (an earlier guess that cost a day)
+  DST_HI,                           # probes/live24_const: r26 -> ac d0 42 (byte2 bit6)
+  Field("v0_6", B(1, 0), 7),        # imm[6:0]
+  Field("v25_31", B(3, 1), 7),      # imm[31:25]
+  Field("v7_8", B(4, 1), 2),        # imm[8:7]
+  Field("v9_10", B(4, 3), 2),       # imm[10:9]
+  Field("v11_12", B(5, 2), 2),      # imm[12:11]
+  Field("v13_20", B(6, 0), 8),      # imm[20:13]
+  Field("v21_24", B(7, 0), 4)),     # imm[24:21]
   doc="dst = 32-bit immediate (any bit pattern; used for floats and for a loop counter's -1 start)")
+_MOVIMM_SLICES = (("v0_6", 0, 7), ("v7_8", 7, 2), ("v9_10", 9, 2), ("v11_12", 11, 2), ("v13_20", 13, 8), ("v21_24", 21, 4), ("v25_31", 25, 7))
 NOP = Inst("nop", bytes.fromhex("0600"))
 STOP = Inst("stop", bytes.fromhex("0e000000"))
 GET_TID = Inst("get_tid", bytes.fromhex("1ca01006"), doc="read thread_position_in_grid (prologue)")
@@ -164,11 +190,10 @@ BARRIER = STORE_WAIT # old name
 
 TABLE = (LOAD_IDX, LOAD, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE_IDX, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
 
-def movimm_fields(f:float) -> dict[str, int]:
-  v = struct.unpack("<I", struct.pack("<f", f))[0]
-  return dict(hi7=v >> 25, mid21=v & 0x1FFFFF, lo4=(v >> 21) & 0xf)
-def movimm_value(d:dict[str, int]) -> float:
-  return struct.unpack("<f", struct.pack("<I", (d["hi7"] << 25) | (d["lo4"] << 21) | d["mid21"]))[0]
+def movimm_bits_fields(v:int) -> dict[str, int]: return {n: (v >> lo) & ((1 << w) - 1) for n, lo, w in _MOVIMM_SLICES}
+def movimm_fields(f:float) -> dict[str, int]: return movimm_bits_fields(struct.unpack("<I", struct.pack("<f", f))[0])
+def movimm_bits(d:dict[str, int]) -> int: return sum(d[n] << lo for n, lo, _ in _MOVIMM_SLICES)
+def movimm_value(d:dict[str, int]) -> float: return struct.unpack("<f", struct.pack("<I", movimm_bits(d)))[0]
 
 # ---- disassembler -----------------------------------------------------------------------------------------------------------------
 def fmt(inst:Inst, d:dict[str, int]) -> str:
@@ -187,15 +212,15 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
   if inst is BRANCH: return f"branch {d['off'] - (1 << 40) if d['off'] >> 39 else d['off']:+d}"
   if inst is STORE: return f"store r{d['src']}, {d['slot']}" + "".join(f" ; {n}" for n in ("first", "wait", "last") if d[n])
   if inst is FALU or inst is FALU_LONG:
-    op, dst, a = "fmul" if d["mul"] else "fadd", f"r{d['dst']}", f"r{operand_reg(d['srca'])}"
+    op, dst, a = "fmul" if d["mul"] else "fadd", f"r{dst_reg(d)}", f"r{operand_reg(d['srca'])}"
     flags = "".join(f" ; {n}" for n in ("killa", "killb", "fwd") if d[n]) + (f" ; tag {d['tag']:02x}" if inst is FALU_LONG and d["tag"] != 0xc0 else "")
     if inst is FALU_LONG and d["ext"] & 0x80: return f"{op} {dst}, {a}, #{'-' if d['killb'] else ''}{e4m3_value(d['srcb']):g}{flags}"
     return f"{op} {dst}, {a}, r{operand_reg(d['srcb'])}{flags}"
   if inst is FMA:
     a = f"#{e4m3_value(d['srca'] | 1):g}" if d["aimm"] else f"r{operand_reg(d['srca'])}"
     c = f"#{'-' if d['c_hi'] else ''}{e4m3_value(d['c'] | 1):g}" if d["c_imm"] else f"{'-' if d['c_neg'] else ''}r{d['c'] >> 1}"
-    return f"fma r{d['dst']}, {'-' if d['negp'] else ''}{a}, r{operand_reg(d['srcb'])}, {c}" + "".join(f" ; {n}" for n in ("killa", "killb", "fwd") if d[n])
-  if inst is MOVIMM: return f"movimm r{d['dst']}, #{movimm_value(d):g}"
+    return f"fma r{dst_reg(d)}, {'-' if d['negp'] else ''}{a}, r{operand_reg(d['srcb'])}, {c}" + "".join(f" ; {n}" for n in ("killa", "killb", "fwd") if d[n])
+  if inst is MOVIMM: return f"movimm r{dst_reg(d)}, #{movimm_value(d):g}"
   return inst.mnemonic
 
 def disassemble(code:bytes, entry:int=0x40) -> list[tuple[int, bytes, str]]:
