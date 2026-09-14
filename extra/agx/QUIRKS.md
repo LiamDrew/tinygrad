@@ -47,6 +47,18 @@ Freezes and hangs are marked. Never emit an instruction whose fields you have no
   `live_b` flags zero their operands. We have no encoding that kills an mma operand.
 - **Never declare fewer registers than the kernel names.** That is what froze the machine (Registers, above); `asm.build` now asserts it.
 
+## Apple's compiler on our own algorithm
+- `extra/agx/mm_metal_ref.py` writes mm_direct's exact algorithm in Metal and runs Apple's compiled output through the same dispatch.
+  At N=2048, min of 10, alternated: ours 3157 us, Apple's compiler on the same algorithm 3274 us (3.7% slower), and the hardware
+  ceiling is ~2900. Careful hand assembly is slightly ahead of the compiler, not behind it.
+- **How the source is written matters 3.6x.** Expressing the 4x4 accumulators as `simdgroup_float8x8 c[4][4]` with `for` loops, which is
+  the natural way, gives 11500 us: the compiler does not unroll those loops, so its inner loop holds 4 mmas instead of 16. Writing every
+  fragment and accumulator as its own named variable gives 3274. tinygrad's Metal renderer emits the unrolled form, which is why stock
+  Metal was competitive in the earlier comparisons.
+- Apple's unrolled loop body is 502 bytes with 11 loads and heavy address arithmetic against our 354 bytes with 8 loads and 5 `iadd`s,
+  because it recomputes addresses from the loop counter where we increment pointers. It uses both scoreboard slots and sets kill bits
+  throughout, and is still slower, which is more evidence that neither of those is worth anything here.
+
 ## Measuring, part two: cache residency
 - The same latency-bound kernel measured 21 us in two process launches and 55 in a third, with identical bytes. Its working set is 4.4 MB, right
   at the edge of what stays resident, so whether the buffer survives between launches changes the answer by 2.6x. An earlier "12% faster at 64
