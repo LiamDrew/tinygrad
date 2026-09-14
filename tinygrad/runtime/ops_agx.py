@@ -1,6 +1,7 @@
 # AGX: hand-assembled Apple GPU machine code on the HCQ2 Metal device. Metal only mints the pipeline state; the GPU runs our bytes.
 from __future__ import annotations
 import ctypes, struct, functools, bisect
+from math import prod
 from tinygrad.helpers import Target
 from tinygrad.device import Compiler
 from tinygrad.renderer import Renderer
@@ -30,6 +31,9 @@ def is_free(u:UOp) -> bool: # CAST/BITCAST that keep the register's bits: bool <
 def strip(u:UOp) -> UOp: # the value-carrying UOp behind free casts, AFTER and NOOP
   while is_free(u) or u.op in {Ops.AFTER, Ops.NOOP}: u = u.src[0]
   return u
+def vcount(u:UOp) -> int: # elements of a vector-shaped value ((4,) loads/stores after the optimizer's float4 upcast); 1 for scalars
+  try: return int(prod(u.shape)) if u.shape else 1
+  except Exception: return 1
 def is_int(u:UOp) -> bool: return dtypes.is_int(u.dtype) or u.dtype == dtypes.bool   # dtypes.is_int includes the weak int of constants
 def is_e4m3(v) -> bool:
   try: dsl.e4m3(float(v)); return True
@@ -41,7 +45,7 @@ class AGXCompiler(Compiler):
   def disassemble(self, lib:bytes): print(dsl.disasm_str(text_section(split_archive(lib)[0])))
 
 class AGXRenderer(Renderer):
-  has_local, has_shared, supports_float4 = True, False, False   # threadgroups yes, threadgroup memory not yet, scalar only
+  has_local, has_shared, supports_float4 = True, False, True    # threadgroups yes, threadgroup memory not yet; 2/4-wide loads and stores (scalar ALU)
   local_max = (1024, 1024, 1024)                                # MetalQueue: global_size = threadgroups, local_size = threads per group
   compiler = AGXCompiler()
   # hardware transcendentals (dsl.TRANS); tinygrad decomposes every float op missing here (SIN: codegen/decomp/transcendental.py). Values unused.
@@ -75,21 +79,38 @@ class AGXRenderer(Renderer):
     # right before that use. tinygrad issues every load of an unrolled reduce first; lowering them in place needs a register per load.
     BOUNDARY = {Ops.STORE, Ops.RANGE, Ops.END, Ops.IF, Ops.ENDIF, Ops.BARRIER}
     lazy:set[UOp] = set(); emit_at:dict[UOp, int] = {}   # a lazy load reads its address at emit_at (liveness below uses it)
+    early_budget = [24]   # registers the non-lazy vector loads may hold at once
+    split:set[UOp] = set()   # vector loads lowered as per-element lazy scalar loads (offset + k): each element lives only from its own load to its last use
     def epos(c:UOp) -> int: return pos[fused[c]] if c in fused else emit_at.get(c, pos[c])   # where consumer c is actually emitted
     for u in uops:
-      if u.op is Ops.LOAD and strip(u.src[0].src[0]).op is not Ops.BUFFER and (us:=uses.get(u)):
+      if u.op is Ops.LOAD and strip(u.src[0].src[0]).op is not Ops.BUFFER and (us:=uses.get(u)):   # src[0]: INDEX, or SHRINK(param, start, n) for a vector
+        us = [c for x in us for c in (uses.get(x, []) if x.op is Ops.INDEX else [x])]   # a vector load's users are element INDEXes; the real consumers are theirs
         first = min(epos(x) for x in us)
-        if not any(w.op in BOUNDARY for w in uops[pos[u] + 1:first]): lazy.add(u); emit_at[u] = first
+        # vector loads stay where tinygrad put them (the start of the unrolled body) while they fit a register budget: issuing them together and
+        # consuming later hides their latency (256 matmul: 131 us vs 430 us with each load right before its consumer). Scalar loads and the rest stay
+        # lazy so fully unrolled reduces (128 loads up front) fit in 64 registers.
+        if not any(w.op in BOUNDARY for w in uops[pos[u] + 1:first]):
+          if vcount(u) > 1 and early_budget[0] >= vcount(u): early_budget[0] -= vcount(u); continue
+          if vcount(u) > 1:
+            ats = [min(epos(c) for c in uses.get(x, [])) for x in uses[u]]   # per element INDEX: its first consumer
+            if not any(w.op in BOUNDARY for w in uops[pos[u] + 1:max(ats)]):
+              split.add(u); emit_at[u] = max(ats)   # the address is read by the last element's load
+              for x, a in zip(uses[u], ats): emit_at[x] = a
+            continue
+          lazy.add(u); emit_at[u] = first
     # deferred address math: an int ADD/MUL used only by INDEXes (or by other deferred ops) is computed on demand by the load/store that
     # needs it (intop), so its register is not held from its linear position. Its operands are then read at that consumer's position.
     deferred:set[UOp] = set()
     for u in reversed(uops):
-      if is_int(u) and u.op in {Ops.ADD, Ops.MUL} and (us:=uses.get(u)) and all(x.op is Ops.INDEX or x in deferred for x in us):
-        ats = [epos(c) for x in us for c in (uses.get(x, []) if x.op is Ops.INDEX else [x])]
+      if is_int(u) and u.op in {Ops.ADD, Ops.MUL} and (us:=uses.get(u)) and all(x.op in {Ops.INDEX, Ops.SHRINK} or x in deferred for x in us):
+        ats = [epos(c) for x in us for c in (uses.get(x, []) if x.op in {Ops.INDEX, Ops.SHRINK} else [x])]
         if ats: deferred.add(u); emit_at[u] = max(ats)
     # liveness: the last position each value is read, looking through INDEX/CAST/AFTER. a value read inside a loop that did not define it
     # is live until that loop's END (it is read again next iteration).
-    def roots(u:UOp) -> list[UOp]: return [r for s in u.src for r in roots(s)] if u.op in {Ops.INDEX, Ops.AFTER, Ops.NOOP} or is_free(u) else [u]
+    def roots(u:UOp) -> list[UOp]:
+      if u.op is Ops.INDEX and strip(u.src[0]) in split: return [u]        # an element of a split vector load is a value of its own
+      if u in split: return roots(u.src[0])                                # the split load itself is never emitted; its address is
+      return [r for s in u.src for r in roots(s)] if u.op in {Ops.INDEX, Ops.SHRINK, Ops.AFTER, Ops.NOOP, Ops.STACK} or is_free(u) else [u]
     end_of = {e.src[1]: e for e in uops if e.op is Ops.END}
     loops = [(pos[l], pos[e]) for l, e in end_of.items()]
     last:dict[UOp, int] = {}
@@ -120,6 +141,12 @@ class AGXRenderer(Renderer):
         free.remove(r); owned.setdefault(u, []).append(r); return r
       raise RuntimeError(f"AGX renderer: out of registers at {u.op} (need r <= {limit}, {len(free)} free); spilling is not implemented")
     def alloc_int(u:UOp) -> int: return alloc(u, 31, 8)
+    def alloc_block(u:UOp, n:int, prefer:int=32) -> int: # n consecutive registers (vector loads/stores; any alignment works on hardware)
+      for r in [r for r in free if r >= prefer] + [r for r in free if r < prefer]:
+        if all(r + k in free for k in range(n)) and r + n - 1 < NREGS:
+          for k in range(n): free.remove(r + k); owned.setdefault(u, []).append(r + k)
+          return r
+      raise RuntimeError(f"AGX renderer: no {n} consecutive free registers at {u.op}")
     scratch:list[int] = []   # registers that live only until the end of the current step (materialized constants)
     def alloc_scratch(u:UOp) -> int:
       r = alloc(u, 31, 8) if is_int(u) else alloc(u); owned[u].remove(r); scratch.append(r); return r
@@ -137,12 +164,27 @@ class AGXRenderer(Renderer):
         d = alloc_scratch(u)
         lines.append(f"movimm r{d}, #0x{int(u.arg) & 0xffffffff:08x}" if is_int(u) else f"movimm r{d}, #{float(u.arg)}")   # weak int consts count
         return d
+      if u.op is Ops.INDEX and vcount(v:=strip(u.src[0])) > 1:   # element k of a vector load
+        k = cval(u.src[1]); assert k is not None
+        if v in split:   # its own scalar load, right here
+          ix = v.src[0]; base, off = idx_split(ix.src[1]); d = alloc(u); reg[u] = d
+          lines.append(f"load r{d}, {slot[strip(ix.src[0])]}, r{base}, #{off + k}"); return d
+        val(v); return vregs[v][k]
       if u.op is Ops.LOAD and (a:=acc_of(u)) is not None: return acc_reg(*a)
       if u in lazy: return emit_load(u)
       raise RuntimeError(f"AGX renderer: {u.op} has no register")
+    vregs:dict[UOp, list[int]] = {}   # vector load -> its element registers (a block, or scattered scalar loads when no block is free)
     def emit_load(u:UOp) -> int:
-      ix = u.src[0]; d = alloc_int(u) if is_int(u) else alloc(u); reg[u] = d
-      lines.append(f"load r{d}, {slot[strip(ix.src[0])]}, r{idxreg(ix.src[1])}"); lines.append("wait")
+      ix, n = u.src[0], vcount(u)
+      base, off = idx_split(ix.src[1]); sl = slot[strip(ix.src[0])]
+      if n > 1:
+        try: d = alloc_block(u, n); vregs[u] = [d + k for k in range(n)]; lines.append(f"load{n} r{d}, {sl}, r{base}" + (f", #{off}" if off else ""))
+        except RuntimeError:   # fragmented register file: n scalar loads at consecutive offsets
+          vregs[u] = [alloc(u) for _ in range(n)]; d = vregs[u][0]
+          for k, r in enumerate(vregs[u]): lines.append(f"load r{r}, {sl}, r{base}, #{off + k}")
+      else:
+        d = alloc_int(u) if is_int(u) else alloc(u); lines.append(f"load r{d}, {sl}, r{base}" + (f", #{off}" if off else ""))
+      reg[u] = d
       return d
     def fsrc(u:UOp) -> str: # float operand: E4M3 immediate or register
       return f"#{float(cval(u))}" if cval(u) is not None and is_e4m3(cval(u)) else f"r{val(u)}"
@@ -168,6 +210,12 @@ class AGXRenderer(Renderer):
         d = alloc_int(u); lines.append(f"iadd r{d}, r{ra}, r{rb}")
       reg[u] = d; done.add(u); return d
     def idxreg(idx:UOp) -> int: return intop(idx) if strip(idx).op in {Ops.ADD, Ops.MUL} else val(idx)
+    def idx_split(idx:UOp, lim:int=1 << 11) -> tuple[int, int]: # (register, immediate) for base + const: the load/store carries the constant
+      u = strip(idx)
+      if u.op is Ops.ADD and any(cval(s) is not None and 0 <= cval(s) < lim for s in u.src):
+        c = next(s for s in u.src if cval(s) is not None); o = next(s for s in u.src if s is not c)
+        return idxreg(o), int(cval(c))
+      return idxreg(idx), 0
     acc_regs:dict[UOp, list[int]] = {}   # register-array accumulators: BUFFER (AddrSpace.REG, size n) -> n registers, indexed by constants
     def acc_of(store_or_load:UOp) -> tuple[UOp, int]|None: # (accumulator, element) behind an INDEX, or None for a memory buffer
       ix = store_or_load.src[0]; b = strip(ix.src[0])
@@ -179,7 +227,7 @@ class AGXRenderer(Renderer):
     i = 0
     while i < len(uops):
       u = uops[i]
-      if u in done or u in fused or u in deferred or is_free(u) or u.op in {Ops.PARAM, Ops.CONST, Ops.AFTER, Ops.SINK, Ops.NOOP, Ops.GROUP, Ops.INDEX}:
+      if u in done or u in fused or u in deferred or is_free(u) or u.op in {Ops.PARAM, Ops.CONST, Ops.AFTER, Ops.SINK, Ops.NOOP, Ops.GROUP, Ops.INDEX, Ops.SHRINK, Ops.STACK}:
         expire(i); i += 1; continue
       if u.op is Ops.BUFFER:                                    # register-resident accumulators: one register per element
         assert u.arg.addrspace is AddrSpace.REG, f"{u.arg.addrspace} buffers are not implemented (threadgroup memory needs has_shared)"
@@ -195,7 +243,7 @@ class AGXRenderer(Renderer):
       elif u.op is Ops.LOAD:
         ix = u.src[0]
         if (acc:=acc_of(u)) is not None: reg[u] = acc_reg(*acc)  # accumulator read: alias
-        elif u not in lazy: emit_load(u)                        # lazy loads are emitted by val() at their first use
+        elif u not in lazy and u not in split: emit_load(u)     # lazy loads are emitted by val() at their first use
       elif u.op is Ops.STORE:
         ix, v = u.src[0], u.src[1]
         if (acc:=acc_of(u)) is not None:                        # accumulator write
@@ -204,7 +252,16 @@ class AGXRenderer(Renderer):
           elif (rv:=val(v)) != ra: lines.append(f"ior r{ra}, r{rv}, r{rv}")   # register move (bitwise, any 32-bit type)
         else:
           assert v.dtype.itemsize == 4, f"only 32-bit stores for now, not {v.dtype} (float16/bfloat16 are not supported: dsl.DTYPES)"
-          lines.append(f"store r{val(v)}, {slot[strip(ix.src[0])]}, r{idxreg(ix.src[1])}")
+          n = vcount(u)
+          if n > 1:   # STACK of n values: consecutive registers already (accumulator elements) or moved into a fresh block
+            vs = [val(s) for s in strip(v).src]; assert len(vs) == n
+            if any(r != vs[0] + k for k, r in enumerate(vs)):
+              b = alloc_block(u, n)
+              for k, r in enumerate(vs): lines.append(f"ior r{b + k}, r{r}, r{r}")
+              vs = [b + k for k in range(n)]
+            base, off = idx_split(ix.src[1]); lines.append(f"store{n} r{vs[0]}, {slot[strip(ix.src[0])]}, r{base}" + (f", #{off}" if off else ""))
+          else:
+            base, off = idx_split(ix.src[1]); lines.append(f"store r{val(v)}, {slot[strip(ix.src[0])]}, r{base}" + (f", #{off}" if off else ""))
       elif u.op in {Ops.ADD, Ops.MUL} and u.dtype == dtypes.float:
         us = uses.get(u, [])
         # destination: the accumulator when this value's only use is an accumulator store, else a fresh register

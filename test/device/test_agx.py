@@ -10,8 +10,8 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
     text, n, written = asm.assemble_text(src)
     self.assertEqual((n, written), (3, {0}))
     body = [t for _, _, t in dsl.disassemble(text)]
-    self.assertEqual(body, [".preamble 64 bytes", "getsr r1, tid.x", "load r0, 1, r1 ; first ; more", "wait", "load r2, 2, r1", "wait", "fadd r4, r0, r2",
-                            "store r4, 0, r1 ; last", "store_wait", "stop"])
+    self.assertEqual(body, [".preamble 64 bytes", "getsr r1, tid.x", "load r0, 1, r1 ; first ; more", "load r2, 2, r1", "fadd r4, r0, r2",
+                            "store r4, 0, r1 ; last", "stop"])
     self.assertFalse(any(t.startswith(".short") for t in body), "every emitted byte decodes")
 
   def test_apple_bytes_decode(self): # bytes captured from probes/*.metal
@@ -20,8 +20,13 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
                        ("c9110015", "fadd r12, r10, r8"),                                        # sums_live: 4-byte form, explicit dst
                        ("3905040100c0", "fadd r3, r0, r2"),                                      # keep_inputs: odd dst
                        ("09c9140180c0", "fadd r0, r0, #3 ; killa"),                              # add_const: E4M3 immediate
-                       ("6700440400012000", "load r2, 0, r1"), ("e700540800012100", "store r4, 0, r1 ; last"), ("e700560000012000", "store r0, 0, r1 ; wait"),
-                       ("6700440000822000", "load r0, 0, r2 ; killa"),   # probes/off1.metal: byte5 82 = areg r2 with its kill bit
+                       ("6700440400012000 510100404600".replace(" ", ""), "load r2, 0, r1"), ("e700540800012100 110000901100".replace(" ", ""), "store r4, 0, r1 ; last"),
+                       ("e700560000012000 110000901100".replace(" ", ""), "store r0, 0, r1 ; wait"),
+                       ("6700440000822000 510100404600".replace(" ", ""), "load r0, 0, r2 ; killa"),   # probes/off1.metal: byte5 82 = areg r2 with its kill bit
+                       ("6710440001042000 570100404000".replace(" ", ""), "load4 r0, 1, r4 ; first ; fmt 0"),   # probes/mem/ld4: a float4 pointer, index scaled by 16 bytes
+                       ("6710440001022000 590100404800".replace(" ", ""), "load2 r0, 1, r2 ; first ; fmt 8"),
+                       ("e700540000042100 170000101000".replace(" ", ""), "store4 r0, 0, r4 ; last ; fmt 0"),
+                       ("6700541601892000 570900404600".replace(" ", ""), "load4 r11, 1, r9 ; more ; killa ; sb 111"),   # Apple's NOOPT matmul: count 4, element stride
                        ("af02560002 00b0400000".replace(" ", ""), "exp2 r0, r0 ; killa ; wait"), ("2f02560403009240 0000".replace(" ", ""), "log2 r2, r0 ; wait"),   # probes/trans
                        ("af00560002001048 2000".replace(" ", ""), "rcp r0, r0 ; killa ; wait"), ("2f01540403109240 0000".replace(" ", ""), "rsqrts r2, r4")]:
       b = bytes.fromhex(hexs)
@@ -45,16 +50,16 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
     src = ("load r0, 1\nwait\nload r2, 2\nwait\nisub r4, r0, r2\nineg r5, r0\nimul r6, r0, r2\niand r7, r0, r2\nior r8, r0, r2\nixor r9, r0, r2\n"
            "imax r10, r0, r2\nimin r22, r0, r2\nisel r12, r0, r2, r4\nisel r13, r0, r2, r4, r5\nicmp.lt r14, r0, r2\nicmp.ne r30, r0, r2\nstore r4, 0\n")
     text, _, _ = asm.assemble_text(src)
-    body = [(bs.hex(), t) for _, bs, t in dsl.disassemble(text)][6:-3]
+    body = [(bs.hex(), t) for _, bs, t in dsl.disassemble(text)][4:-2]
     self.assertEqual([t for _, t in body], ["isub r4, r0, r2", "ineg r5, r0", "imul r6, r0, r2", "iand r7, r0, r2", "ior r8, r0, r2", "ixor r9, r0, r2",
                                             "imax r10, r0, r2", "imin r22, r0, r2", "isel r12, r0, r2, r4, r0", "isel r13, r0, r2, r4, r5",
                                             "icmp.lt r14, r0, r2", "icmp.ne r30, r0, r2"])
     text, _, _ = asm.assemble_text("load r0, 1\nwait\nload r2, 2\nwait\nishl r4, r0, #5\nishr r5, r2, #3\nushr r6, r0, #1\nishl r7, r0, r2\nishr r8, r2, r0\nushr r9, r0, r2\nstore r4, 0\n")
-    self.assertEqual([t for _, _, t in dsl.disassemble(text)][6:-3], ["ishl r4, r0, #5", "ishr r5, r2, #3", "ushr r6, r0, #1", "ishl r7, r0, r2", "ishr r8, r2, r0", "ushr r9, r0, r2"])
+    self.assertEqual([t for _, _, t in dsl.disassemble(text)][4:-2], ["ishl r4, r0, #5", "ishr r5, r2, #3", "ushr r6, r0, #1", "ishl r7, r0, r2", "ishr r8, r2, r0", "ushr r9, r0, r2"])
     text, _, _ = asm.assemble_text("load r0, 1\nwait\ni2f r4, r0\nu2f r5, r0\nf2i r6, r0\nf2u r22, r0\nstore r4, 0\n")
-    self.assertEqual([t for _, _, t in dsl.disassemble(text)][4:-3], ["i2f r4, r0", "u2f r5, r0", "f2i r6, r0", "f2u r22, r0"])
+    self.assertEqual([t for _, _, t in dsl.disassemble(text)][3:-2], ["i2f r4, r0", "u2f r5, r0", "f2i r6, r0", "f2u r22, r0"])
     text, _, _ = asm.assemble_text("load r0, 1\nwait\nexp2 r4, r0\nlog2 r5, r0\nrcp r6, r0\nrsqrt r7, r0\nrsqrts r22, r0\nstore r4, 0\n")
-    self.assertEqual([t for _, _, t in dsl.disassemble(text)][4:-3], ["exp2 r4, r0 ; wait", "log2 r5, r0 ; wait", "rcp r6, r0 ; wait", "rsqrt r7, r0 ; wait", "rsqrts r22, r0 ; wait"])
+    self.assertEqual([t for _, _, t in dsl.disassemble(text)][3:-2], ["exp2 r4, r0 ; wait", "log2 r5, r0 ; wait", "rcp r6, r0 ; wait", "rsqrt r7, r0 ; wait", "rsqrts r22, r0 ; wait"])
     self.assertEqual(body[0][0], "1f01560802001 0a81105".replace(" ", ""))   # verified on hardware: a - b into r4, kill bits clear (Apple: 17)
     self.assertEqual(body[3][0], "7b050701000000800000")                     # and, kill bits clear (07, Apple: 1f)
 
@@ -390,6 +395,40 @@ class TestAGX(unittest.TestCase):
         ref = np.exp(A) / np.exp(A).sum(1, keepdims=True)
         self.assertLess(np.abs(Tensor(A).contiguous().realize().softmax(axis=1).numpy() - ref).max(), 1e-6)
     self.assertTrue(np.isnan(Tensor([np.inf, np.nan]).sin().numpy()).all())
+
+  def test_vector_memory(self): # probes/mem: 14-byte loads/stores with a width and an immediate element offset (dsl.LOAD), 8 threads, x[i] = 2^i
+    k = ".buffers 3\n%s\n"
+    for body, want in [("load4 r4, 1, r1\nfadd r8, r4, r5\nfadd r8, r8, r6\nfadd r8, r8, r7\nstore r8, 0", [15.0 * 2 ** t for t in range(8)]),   # elements t..t+3 (unscaled index)
+                       ("load4 r5, 1, r1\nstore r8, 0", [8.0 * 2 ** t for t in range(8)]),                                                       # any dst, 4th element
+                       ("load2 r4, 1, r1, #2\nfadd r8, r4, r5\nstore r8, 0", [12.0 * 2 ** t for t in range(8)]),                                    # offset 2: elements t+2, t+3
+                       ("load r4, 1, r1, #1000\nstore r4, 0", [2.0 ** ((1000 + t) % 32) for t in range(8)]),                                       # 10-bit offset
+                       ("load4 r4, 1, r1\nstore4 r4, 0, r1", [2.0 ** t for t in range(8)]),                                                         # overlapping 4-wide stores agree
+                       ("load4 r4, 1, r1\nstore4 r4, 0, r1, #1", [2.0 ** (t - 1) for t in range(1, 8)])]:                                          # store offset
+      with self.subTest(body=body.split("\n")[0]):
+        got = self.run_asm8v(k % body)
+        self.assertEqual(got[8 - len(want):8], want)
+    self.assertEqual(self.run_asm8v(k % "load r4, 1, r1\nstore r4, 0, r1, #8")[8:16], [2.0 ** t for t in range(8)])   # store offset bit 3 (byte 10)
+
+  def run_asm8v(self, src:str) -> list[float]: # 8 threads over 2048-element inputs data1[i] = 2^(i mod 32), data2[i] = 100 + i; returns data0[:16]
+    from tinygrad.runtime import ops_agx, ops_metal
+    from tinygrad import codegen
+    from tinygrad.runtime.support import hcq2
+    from tinygrad.engine import realize
+    for c in (codegen.to_program_cache, hcq2.hcq_compile_cache, hcq2.link_linear_cache, realize.runtime_cache): c.clear()
+    Device[Device.DEFAULT].wait_timeout_ms = 10000.0
+    with patch.object(ops_agx.AGXRenderer, "render", lambda self, uops: src), \
+         patch.object(ops_metal.MetalQueue, "dims", staticmethod(lambda prg: (8, 1, 1, 1, 1, 1))):
+      x, y = Tensor([2.0 ** (i % 32) for i in range(2048)]).contiguous().realize(), Tensor([100.0 + i for i in range(2048)]).contiguous().realize()
+      return (x + y).tolist()[:16]
+
+  def test_float4_tensors(self): # the renderer's vector loads/stores and immediate offsets under the optimizer (supports_float4)
+    import numpy as np
+    A = np.arange(1024, dtype=np.float32).reshape(32, 32); B = (np.arange(1024, dtype=np.float32).reshape(32, 32) % 7) - 3
+    a, b = Tensor(A).contiguous().realize(), Tensor(B).contiguous().realize()
+    np.testing.assert_allclose((a @ b).numpy(), A @ B, rtol=1e-6)
+    np.testing.assert_array_equal((a + b).numpy(), A + B)
+    np.testing.assert_array_equal((a * 2 + 1)[:, 4:20].numpy(), (A * 2 + 1)[:, 4:20])
+    np.testing.assert_array_equal(a.sum(axis=1).numpy(), A.sum(axis=1))
 
   def test_two_stores(self): # each store followed by STORE_WAIT; the second overwrites the first
     self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nstore r0, 0\nstore r2, 0\n", 1.5, 2.25), 2.25)

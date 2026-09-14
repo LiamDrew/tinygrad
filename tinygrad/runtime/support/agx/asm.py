@@ -8,17 +8,18 @@ from tinygrad.renderer.agx import dsl
 MAXREG=[0] # highest register named while assembling, declared to the driver in the metadata
 def reg(tok):
     assert tok[0]=='r'; MAXREG[0]=max(MAXREG[0], int(tok[1:])); return int(tok[1:])
-def i_load_idx(dstreg, slot, areg, first, more_follow, kill=False): # kill: areg dies here (dsl.KILL_MODEL)
-    return dsl.LOAD.encode(first=int(first), more=int(more_follow), dst=dstreg, slot=slot, areg=areg, killa=int(kill))
+def i_load_idx(dstreg, slot, areg, first, more_follow, kill=False, count=1, off=0): # kill: areg dies here (dsl.KILL_MODEL); count consecutive dsts
+    return dsl.LOAD.encode(first=int(first), more=int(more_follow), dst=dstreg, slot=slot, areg=areg, killa=int(kill), wcode=dsl.WCODE[count], sb0=1, sb1=1,
+                           fmt=6, **dsl.off_fields(off))
 def i_load(dstreg, slot, first, more_follow): return i_load_idx(dstreg, slot, 1, first, more_follow) # buf[t]: the thread index is in r1
 def i_addr(dst, shift, imm=None, breg=None, a=1): # rD = (rA << shift) + imm, or + rB; A defaults to r1, the thread index
     assert 0 <= shift <= 4
     b = (breg << 2 | 1) if breg is not None else imm << 1
     return dsl.ADDR.encode(dst=dst, a=a, b=b, breg=int(breg is not None), shift0=shift & 1, shift1=(shift >> 1) & 1, noshift=int(shift == 0))
-def i_store_idx(srcreg, slot, areg, first=False, wait=False, last=False, kill=False): # every store is followed by its wait, like Apple
-    return dsl.STORE.encode(first=int(first), wait=int(wait), src=srcreg, slot=slot, areg=areg, killa=int(kill), last=int(last)) + dsl.STORE_WAIT.encode()
+def i_store_idx(srcreg, slot, areg, first=False, wait=False, last=False, kill=False, count=1, off=0):
+    return dsl.STORE.encode(first=int(first), wait=int(wait), src=srcreg, slot=slot, areg=areg, killa=int(kill), last=int(last), wcode=dsl.WCODE[count], s7=1, fmt=1,
+                            **dsl.store_off_fields(off))
 def i_imul(dst, stride): return dsl.IMUL.encode(dst=dst, stride=stride)
-def i_wait(): return dsl.WAIT.encode()
 def loop_head(c, n, depth): # init and the increment/compare/enter block. between them the assembler puts the `pre` section (counter = 0..n-1)
     assert n >= 2, "loop counts below 2 hang the GPU"
     assert n <= 255, f"loop counts above 255 need a register-held count (not implemented), got {n}"
@@ -60,13 +61,14 @@ def assemble_text(program):
         op=p[0]
         if op=='.buffers': N=int(p[1]); continue
         body.append(p)
-    total_loads=sum(1 for p in body if p[0]=='load'); last_store=max((i for i,p in enumerate(body) if p[0]=='store'), default=-1)
+    total_loads=sum(1 for p in body if p[0].startswith('load')); last_store=max((i for i,p in enumerate(body) if p[0].startswith('store')), default=-1)
     for bi,p in enumerate(body):
         op=p[0]
-        if op=='load':                                   # load rD, slot  |  load rD, slot, rA  (element offset in rA)
-            d=reg(p[1]); slot=int(p[2]); N=max(N,slot+1)
-            if len(p)>3: main+=i_load_idx(d,slot,reg(p[3]), load_i==0, load_i<total_loads-1)
-            else: main+=i_load(d,slot, load_i==0, load_i<total_loads-1)
+        if op in ('load','load2','load4'):              # load[N] rD, slot [, rA [, #off]] : rD..rD+N-1 = buf[slot][rA + off ..]; rA defaults to r1 = t
+            d=reg(p[1]); slot=int(p[2]); N=max(N,slot+1); n=int(op[4:] or 1)
+            off=int(p[4].lstrip('#')) if len(p)>4 else 0
+            main+=i_load_idx(d,slot,reg(p[3]) if len(p)>3 else 1, load_i==0, load_i<total_loads-1, count=n, off=off)
+            for k in range(1, n): reg(f"r{d+k}")
             load_i+=1; seen_mem=True; pending=True
         elif op=='addr':                                 # addr rD, [rA,] shift, #imm | rB : rD = (rA << shift) + imm | rB  (rA defaults to r1 = t)
             a = reg(p[2]) if len(p) > 4 else 1; sh, b = (int(p[3]), p[4]) if len(p) > 4 else (int(p[2]), p[3])
@@ -113,8 +115,8 @@ def assemble_text(program):
             main+=loops[-1][1]
         elif op=='endloop':
             start, _ = loops.pop(); main+=loop_tail(len(main) - start, len(loops))
-        elif op=='wait':
-            main+=i_wait()
+        elif op=='wait':                                 # accepted for old kernel text: the wait word is part of LOAD now (dsl.LOAD_WAIT_MODEL)
+            pass
         elif op=='raw':                                  # raw <hex bytes>: an instruction under investigation (experiments only)
             main+=bytes.fromhex(''.join(p[1:])); pending=False
         elif op in ('fadd','fmul'):
@@ -129,10 +131,11 @@ def assemble_text(program):
         elif op=='movimm':                               # movimm rD, #1.5  |  movimm rD, #0xdeadbeef (raw bits)
             d=reg(p[1]); v=p[2].lstrip('#')
             main+=movimm_bits(d,int(v,16)) if v.startswith('0x') else movimm_bytes(d,float(v))
-        elif op=='store':                                # store rS, slot  |  store rS, slot, rA (element offset in rA)
-            s=reg(p[1]); slot=int(p[2]); N=max(N,slot+1); written.add(slot)
-            if len(p)>3: main+=i_store_idx(s,slot,reg(p[3]), first=not seen_mem, wait=pending, last=bi==last_store)
-            else: main+=i_store(s,slot, first=not seen_mem, wait=pending, last=bi==last_store)
+        elif op in ('store','store2','store4'):          # store[N] rS, slot [, rA [, #off]] : buf[slot][rA + off ..] = rS..rS+N-1
+            s=reg(p[1]); slot=int(p[2]); N=max(N,slot+1); written.add(slot); n=int(op[5:] or 1)
+            off=int(p[4].lstrip('#')) if len(p)>4 else 0
+            main+=i_store_idx(s,slot,reg(p[3]) if len(p)>3 else 1, first=not seen_mem, wait=pending, last=bi==last_store, count=n, off=off)
+            for k in range(1, n): reg(f"r{s+k}")
             seen_mem=True; pending=False
         else:
             raise ValueError(f"unknown op {op}")
@@ -309,7 +312,7 @@ def build(program):
     """Assemble `program` and return (archive_bytes, N)."""
     MAXREG[0]=0
     text,N,written=assemble_text(program)
-    md=gen_metadata(N, written, nregs=min(128, (MAXREG[0] + 1) * 2))   # over-declare: Apple writes max_reg+1..+7 (r8 -> 9, r47 -> 50, r63 -> 96); 128 GPRs
+    md=gen_metadata(N, written, nregs=min(128, (MAXREG[0] + 9) // 8 * 8 + 8))   # Apple writes max_reg+1..+7 (r7 -> 10, r23 -> 30, r47 -> 50); the count sets occupancy (2x over-declaring cost 2x on matmul). One extra 8-block of margin
     return build_archive(text, md, N), N
 
 if __name__=='__main__':
