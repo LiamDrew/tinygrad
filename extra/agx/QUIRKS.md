@@ -47,6 +47,28 @@ Freezes and hangs are marked. Never emit an instruction whose fields you have no
   `live_b` flags zero their operands. We have no encoding that kills an mma operand.
 - **Never declare fewer registers than the kernel names.** That is what froze the machine (Registers, above); `asm.build` now asserts it.
 
+## Where mm_direct's last 8% goes
+Same 16-mma stream every time, one thing ablated at a time (scratch ablate.py), N=2048, min of 10:
+
+  | variant                                   | time    | cost of the part added |
+  |-------------------------------------------|---------|------------------------|
+  | 16 mmas alone (ceiling)                    | 2920 us | -                      |
+  | + the 5 address `iadd`s                    | 2971 us | 51 us                  |
+  | + the 8 `load2`s, first mma not waiting    | 3013 us | 42 us                  |
+  | + the wait on the first mma (= mm_direct)  | 3145 us | 132 us                 |
+
+So the 225 us gap is 59% memory stall, 23% address arithmetic, 19% load issue. Every way to attack it needs more registers:
+prefetching the next K step needs a second set of 16 fragment registers; unrolling to amortise the address adds needs the same
+(and is otherwise wrong, see the WAR hazard); loading less per mma needs a bigger tile, i.e. more accumulators. All 64 usable
+registers are already spoken for (32 accumulators, 16 fragments, ~11 addresses), so the only source is the far bank r64..r125,
+where the mma's C and D fields do reach but an in-place accumulate once hung the GPU.
+
+## No in-kernel cycle counter
+All 256 special-register indices were read twice with an 8- and a 256-instruction gap between the reads; none returned a
+changing value, so there is no timer or cycle counter to build an instruction-level profiler on. `0x9b` and `0xab` showed a
+delta of 1 in the scan but read 0 four times in a row directly, so that was an artifact of the surrounding instructions.
+Ablation - delete instructions from a real kernel and measure - is the profiler, and the table above is what it produces.
+
 ## Apple's compiler on our own algorithm
 - `extra/agx/mm_metal_ref.py` writes mm_direct's exact algorithm in Metal and runs Apple's compiled output through the same dispatch.
   At N=2048, min of 10, alternated: ours 3157 us, Apple's compiler on the same algorithm 3274 us (3.7% slower), and the hardware
