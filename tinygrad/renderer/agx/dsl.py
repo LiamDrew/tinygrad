@@ -201,6 +201,14 @@ LSHR_REG = Inst("ushr", bytes.fromhex("a71056000200000 0f0100500".replace(" ", "
 ASHR_REG = Inst("ishr", bytes.fromhex("a7115600020000 18e200".replace(" ", "")), (Field("dst", B(3, 1), 7), Field("a", B(5, 2), 6), Field("breg", B(6, 3), 5),
   Field("killa", B(7, 6), 1), Field("killb", B(7, 7), 1)), doc="dst = a >> b, arithmetic (10-byte form like ASHR_IMM; Apple: d8 = both killed)")
 SHIFTS = {("ishl", False): SHL_IMM, ("ushr", False): LSHR_IMM, ("ishr", False): ASHR_IMM, ("ishl", True): SHL_REG, ("ushr", True): LSHR_REG, ("ishr", True): ASHR_REG}
+# converts (probes/cvt/*.metal): source register in byte 5 << 2, 7-bit dst in byte 3, byte 6 bit 5 kills the source (Apple's ac/b4 -> our 8c/94).
+# int -> float is 8 bytes (byte 7 bit 6 = signed); float -> int is 10 bytes, truncating toward zero (-7.9 -> -7), byte 7 bit 6 / byte 8 bit 0 = signed.
+_CVT = (Field("dst", B(3, 1), 7), Field("a", B(5, 2), 6), Field("killa", B(6, 5), 1))
+I2F = Inst("i2f", bytes.fromhex("a70756000200 8c60".replace(" ", "")), _CVT, doc="dst = float(int32 a)")
+U2F = Inst("u2f", bytes.fromhex("a70756000200 8c20".replace(" ", "")), _CVT, doc="dst = float(uint32 a)")
+F2I = Inst("f2i", bytes.fromhex("270756000200 94480300".replace(" ", "")), _CVT, doc="dst = int32(a), truncating toward zero")
+F2U = Inst("f2u", bytes.fromhex("270756000200 94080200".replace(" ", "")), _CVT, doc="dst = uint32(a), truncating")
+CVTS = {"i2f": I2F, "u2f": U2F, "f2i": F2I, "f2u": F2U}
 # the 0x0b bitwise family, 10 bytes: FALU-style operands (byte 1 = srcb, byte 3 = srca, dst nibble + DST_HI), byte 2 bits 3,4 = kills. Bytes 2, 4, 5
 # select the function (Apple: and 1f/00 00, or 1f/02 08, xor 1e/02 08 with the kills set); byte 5 is not an operand (moving b left it unchanged).
 _BIT = lambda name, hexs, doc: Inst(name, bytes.fromhex(hexs), (Field("dst", B(0, 4), 4), Field("srcb", B(1), 8), Field("killb", B(2, 3), 1), Field("killa", B(2, 4), 1),
@@ -250,7 +258,7 @@ STORE_WAIT = Inst("store_wait", bytes.fromhex("110000901100"),
   doc="wait for the preceding store. Apple emits one after every store; two stores back to back lose data without it (test_agx)")
 BARRIER = STORE_WAIT # old name
 
-TABLE = (LOAD, SHL_IMM, LSHR_IMM, ASHR_IMM, SHL_REG, LSHR_REG, ASHR_REG, IADD, ISUB, INEG, IMUL_RR, IAND, IOR, IXOR, IMAX, IMIN, ISEL4, ISEL, ICMP, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
+TABLE = (LOAD, I2F, U2F, F2I, F2U, SHL_IMM, LSHR_IMM, ASHR_IMM, SHL_REG, LSHR_REG, ASHR_REG, IADD, ISUB, INEG, IMUL_RR, IAND, IOR, IXOR, IMAX, IMIN, ISEL4, ISEL, ICMP, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
 
 def movimm_bits_fields(v:int) -> dict[str, int]: return {n: (v >> lo) & ((1 << w) - 1) for n, lo, w in _MOVIMM_SLICES}
 def movimm_fields(f:float) -> dict[str, int]: return movimm_bits_fields(struct.unpack("<I", struct.pack("<f", f))[0])
@@ -281,6 +289,7 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
     c = f"#{'-' if d['c_hi'] else ''}{e4m3_value(d['c'] | 1):g}" if d["c_imm"] else f"{'-' if d['c_neg'] else ''}r{d['c'] >> 1}"
     return f"fma r{dst_reg(d)}, {'-' if d['negp'] else ''}{a}, r{operand_reg(d['srcb'])}, {c}" + "".join(f" ; {n}" for n in ("killa", "killb", "fwd") if d[n])
   if inst is MOVIMM: return f"movimm r{dst_reg(d)}, #{movimm_value(d):g}"
+  if inst in CVTS.values(): return f"{inst.mnemonic} r{d['dst']}, r{d['a']}" + (" ; killa" if d["killa"] else "")
   if inst in SHIFTS.values(): return f"{inst.mnemonic} r{d['dst']}, r{d['a']}, " + (f"r{d['breg']}" if "breg" in d else f"#{d['n']}") + "".join(f" ; {n}" for n in ("killa", "killb") if d.get(n))
   if inst is IADD: return f"iadd r{d['dst']}, r{d['a']}, r{d['breg']}"
   if inst is ISUB: return f"isub r{d['dst']}, r{d['breg']}, r{d['a']}"

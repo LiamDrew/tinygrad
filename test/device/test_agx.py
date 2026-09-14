@@ -1,4 +1,4 @@
-import unittest
+import unittest, struct
 from unittest.mock import patch
 from tinygrad import Tensor, Device
 from tinygrad.renderer.agx import dsl
@@ -49,6 +49,8 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
                                             "icmp.lt r14, r0, r2", "icmp.ne r30, r0, r2"])
     text, _, _ = asm.assemble_text("load r0, 1\nwait\nload r2, 2\nwait\nishl r4, r0, #5\nishr r5, r2, #3\nushr r6, r0, #1\nishl r7, r0, r2\nishr r8, r2, r0\nushr r9, r0, r2\nstore r4, 0\n")
     self.assertEqual([t for _, _, t in dsl.disassemble(text)][6:-3], ["ishl r4, r0, #5", "ishr r5, r2, #3", "ushr r6, r0, #1", "ishl r7, r0, r2", "ishr r8, r2, r0", "ushr r9, r0, r2"])
+    text, _, _ = asm.assemble_text("load r0, 1\nwait\ni2f r4, r0\nu2f r5, r0\nf2i r6, r0\nf2u r22, r0\nstore r4, 0\n")
+    self.assertEqual([t for _, _, t in dsl.disassemble(text)][4:-3], ["i2f r4, r0", "u2f r5, r0", "f2i r6, r0", "f2u r22, r0"])
     self.assertEqual(body[0][0], "1f01560802001 0a81105".replace(" ", ""))   # verified on hardware: a - b into r4, kill bits clear (Apple: 17)
     self.assertEqual(body[3][0], "7b050701000000800000")                     # and, kill bits clear (07, Apple: 1f)
 
@@ -128,6 +130,36 @@ class TestAGX(unittest.TestCase):
                             (5, 3, "ishl r4, r0, r2\nstore r4, 0\n", 40), (-16, 3, "ishr r4, r0, r2\nstore r4, 0\n", -2), (-16, 3, "ushr r4, r0, r2\nstore r4, 0\n", 536870910),
                             (5, 3, "ishl r4, r0, r2\nishl r6, r0, r2\nstore r6, 0\n", 40)]:   # operands survive (no kill bits)
       with self.subTest(a=a, b=b, src=src.split("\n")[0]): self.assertEqual(self.run_asm_int(src, a, b), want)
+
+  def run_asm_cvt(self, src:str, a, from_int:bool): # data1 (int32 or float32) in r0, the stored result read back as the other type
+    from tinygrad import dtypes
+    from tinygrad.runtime import ops_agx
+    from tinygrad import codegen
+    from tinygrad.runtime.support import hcq2
+    from tinygrad.engine import realize
+    for c in (codegen.to_program_cache, hcq2.hcq_compile_cache, hcq2.link_linear_cache, realize.runtime_cache): c.clear()
+    Device[Device.DEFAULT].wait_timeout_ms = 10000.0
+    with patch.object(ops_agx.AGXRenderer, "render", lambda self, uops: ".buffers 2\nload r0, 1\nwait\n" + src):
+      x = Tensor([a], dtype=dtypes.int32 if from_int else dtypes.float32).contiguous().realize()
+      return (x.float() if from_int else x.cast(dtypes.int32)).item()
+
+  def test_converts(self): # probes/cvt: int <-> float, signed and unsigned, truncation toward zero, source re-read (no kill)
+    self.assertEqual(self.run_asm_cvt("i2f r4, r0\nstore r4, 0\n", 7, True), 7.0)
+    self.assertEqual(self.run_asm_cvt("i2f r4, r0\nstore r4, 0\n", -7, True), -7.0)
+    self.assertEqual(self.run_asm_cvt("u2f r4, r0\nstore r4, 0\n", -1, True), 4294967296.0)
+    self.assertEqual(self.run_asm_cvt("f2i r4, r0\nstore r4, 0\n", -7.9, False), -7)
+    self.assertEqual(self.run_asm_cvt("f2u r22, r0\nstore r22, 0\n", 7.9, False), 7)
+    self.assertEqual(self.run_asm_cvt("i2f r4, r0\ni2f r6, r0\nstore r6, 0\n", 5, True), 5.0)
+
+  def test_convert_tensors(self): # the renderer lowers CAST
+    from tinygrad import dtypes
+    from tinygrad.helpers import Context
+    A, F = [5, -2, 7, 0], [1.5, -2.7, 3.0, 0.25]
+    a, f = Tensor(A, dtype=dtypes.int32).contiguous().realize(), Tensor(F).contiguous().realize()
+    with Context(NOOPT=1):
+      for name, t, want in [("i2f", a.float(), [float(x) for x in A]), ("f2i", f.cast(dtypes.int32), [int(x) for x in F]),
+                            ("cmp2f", (a < 3).float(), [float(x < 3) for x in A]), ("mixed", a.float() * f, [x * y for x, y in zip(A, F)])]:
+        with self.subTest(op=name): self.assertEqual(t.tolist(), [struct.unpack("f", struct.pack("f", w))[0] if isinstance(w, float) else w for w in want])
 
   def test_int_compare_select(self):
     for a, b, src, want in [(3, 5, "icmp.lt r4, r0, r2\nstore r4, 0\n", 1), (5, 3, "icmp.lt r4, r0, r2\nstore r4, 0\n", 0), (-1, 5, "icmp.lt r4, r0, r2\nstore r4, 0\n", 1),

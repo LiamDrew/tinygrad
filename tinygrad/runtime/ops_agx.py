@@ -22,8 +22,10 @@ from tinygrad.renderer.agx import dsl
 def cval(u:UOp): # constant value behind CASTs, or None
   while u.op is Ops.CAST: u = u.src[0]
   return u.arg if u.op is Ops.CONST else None
-def strip(u:UOp) -> UOp: # the value-carrying UOp behind CAST/AFTER/NOOP (all no-ops for us: one dtype width, no ordering to keep)
-  while u.op in {Ops.CAST, Ops.AFTER, Ops.NOOP}: u = u.src[0]
+def is_convert(u:UOp) -> bool: # a CAST that changes the bit pattern (int <-> float); other CASTs (bool <-> int, weak types) are free
+  return u.op is Ops.CAST and dtypes.is_float(u.dtype) != dtypes.is_float(u.src[0].dtype)
+def strip(u:UOp) -> UOp: # the value-carrying UOp behind free CAST/AFTER/NOOP
+  while (u.op is Ops.CAST and not is_convert(u)) or u.op in {Ops.AFTER, Ops.NOOP}: u = u.src[0]
   return u
 def is_e4m3(v) -> bool:
   try: dsl.e4m3(float(v)); return True
@@ -62,7 +64,7 @@ class AGXRenderer(Renderer):
     # liveness: the last position each value is read, looking through INDEX/CAST/AFTER. a value read inside a loop that did not define it
     # is live until that loop's END (it is read again next iteration).
     TRANSPARENT = {Ops.INDEX, Ops.CAST, Ops.AFTER, Ops.NOOP}
-    def roots(u:UOp) -> list[UOp]: return [r for s in u.src for r in roots(s)] if u.op in TRANSPARENT else [u]
+    def roots(u:UOp) -> list[UOp]: return [r for s in u.src for r in roots(s)] if u.op in TRANSPARENT and not is_convert(u) else [u]
     end_of = {e.src[1]: e for e in uops if e.op is Ops.END}
     last:dict[UOp, int] = {}
     open_loops:list[UOp] = []
@@ -132,7 +134,8 @@ class AGXRenderer(Renderer):
     i = 0
     while i < len(uops):
       u = uops[i]
-      if u in done or u in fused or u.op in {Ops.PARAM, Ops.CONST, Ops.CAST, Ops.AFTER, Ops.SINK, Ops.NOOP, Ops.INDEX}: expire(i); i += 1; continue
+      if u in done or u in fused or (u.op is Ops.CAST and not is_convert(u)) or u.op in {Ops.PARAM, Ops.CONST, Ops.AFTER, Ops.SINK, Ops.NOOP, Ops.INDEX}:
+        expire(i); i += 1; continue
       if u.op is Ops.BUFFER: reg[u] = alloc(u)                  # a register-resident accumulator
       elif u.op is Ops.RANGE:
         n = cval(u.src[0]); assert n is not None, "symbolic loop bounds are not supported yet"
@@ -176,6 +179,11 @@ class AGXRenderer(Renderer):
         ra, rb = val(u.src[0]), val(u.src[1])
         mn = "icmp.ult" if u.op is Ops.CMPLT and u.src[0].dtype in dtypes.uints else INT2[u.op]
         d = alloc(u); reg[u] = d; lines.append(f"{mn} r{d}, r{ra}, r{rb}")
+      elif u.op is Ops.CAST:                                    # int <-> float convert (a constant source is folded by tinygrad; else it is in a register)
+        src = u.src[0]
+        assert u.dtype.itemsize == 4 and src.dtype.itemsize == 4 or src.dtype == dtypes.bool, f"only 32-bit converts for now: {src.dtype} -> {u.dtype}"
+        mn = ("u2f" if src.dtype in dtypes.uints else "i2f") if dtypes.is_float(u.dtype) else ("f2u" if u.dtype in dtypes.uints else "f2i")
+        ra = val(src); d = alloc(u); reg[u] = d; lines.append(f"{mn} r{d}, r{ra}")
       elif u.op in {Ops.SHL, Ops.SHR} and is_int(u):
         mn = "ishl" if u.op is Ops.SHL else "ushr" if u.dtype in dtypes.uints else "ishr"
         ra, n = val(u.src[0]), cval(u.src[1])
