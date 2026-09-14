@@ -63,6 +63,16 @@ prefetching the next K step needs a second set of 16 fragment registers; unrolli
 registers are already spoken for (32 accumulators, 16 fragments, ~11 addresses), so the only source is the far bank r64..r125,
 where the mma's C and D fields do reach but an in-place accumulate once hung the GPU.
 
+## Pipelining the stall away does not work (and why)
+`extra/agx/mm_pipelined.py` moves the 16 accumulator pairs into the far bank r64..r95, which frees r16..r47 for two complete sets of fragment
+registers, and software-pipelines the loop: while one K step's 16 mmas run, the next step's eight loads are already in flight on the other
+scoreboard slot, writing the other register set, so the WAR hazard cannot bite. It is correct and it is **slower**: 3167 us against mm_direct's
+3156 at N=2048.
+So the 132 us the ablation table attributes to the wait is not a stall that prefetching can recover. With four SIMD groups per threadgroup and
+thousands of threadgroups, the hardware already hides that latency with other groups; removing the wait only looked faster because it removed
+synchronization the kernel actually needs. Ablation prices an instruction, it does not prove the time is recoverable.
+Useful by-product: the far bank is safe for mma accumulators up to r95 and dangerous above it (r112 hung, r124 read zeros).
+
 ## No in-kernel cycle counter
 All 256 special-register indices were read twice with an 8- and a 256-instruction gap between the reads; none returned a
 changing value, so there is no timer or cycle counter to build an instruction-level profiler on. `0x9b` and `0xab` showed a

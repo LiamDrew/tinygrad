@@ -77,9 +77,10 @@ REGISTER_FILE = """128 32-bit registers, r0..r127 (hardware-verified 2026-09-14,
     warm-up kernel; declaring 132 registers did not help). The display froze minutes after those runs, the project's second freeze,
     the first being an undeclared register count (asm.gen_metadata). Never emit r126 or r127. Apple's largest observed count is 96.
   - the metadata register count (fn.f0) must cover every register named; Apple writes max register + 1..+7; we declare max + one 8-block.
-  - far bank r64..r125: loads, stores, shifts (7-bit dst) and the mma's C and D fields reach it; float ALU, movimm and the mma's A/B (bit 7 of their
-    byte is a flag: r70 read as 0) do not. An in-place mma with D = C = r80 (pair zero-initialized by ishl) HUNG the GPU (2026-09-14, recovered by the
-    device timeout); D = r80 with C = r84 had worked. Not used by the renderer."""
+  - far bank: loads, stores, shifts (7-bit dst) and the mma's C and D fields reach it; float ALU, movimm and the mma's A/B do not (bit 7 of an A/B
+    operand byte is the live flag, so r70 read as 0). As mma accumulators r64..r95 are hardware-verified (r80, r84, r94/95, in place and chained,
+    initialized either by a load or by ishl); r112 HUNG the GPU and r124 returned zeros, so treat r96 and above as unusable. An earlier note blamed
+    the hang on in-place far accumulation; that was wrong, the hanging kernel in that batch was the r124 one. Not used by the renderer."""
 
 # ---- the table --------------------------------------------------------------------------------------------------------------------
 
