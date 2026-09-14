@@ -512,6 +512,31 @@ class TestAGX(unittest.TestCase):
         got = self.run_asm8v(".buffers 3\n" + ld(slot) + "\nraw " + bytes(e).hex(" ") + "\n" + st(4) + "\n")[:8]
         self.assertEqual(got == [2.0 ** t for t in range(8)], waits, got)   # the mma's own result is ignored; it is here only to wait
 
+  def test_transformer(self): # a real Llama-shaped model end to end: embedding, RMSNorm, GQA with a KV cache, RoPE, softmax, SwiGLU
+    import math, numpy as np, sys
+    from tinygrad import dtypes, nn
+    from tinygrad.helpers import Context
+    sys.path.insert(0, ".")
+    try: from extra.models.llama import Transformer
+    except ImportError: self.skipTest("extra/models/llama.py not available")
+    cfg = dict(dim=64, hidden_dim=128, n_heads=4, n_layers=2, norm_eps=1e-5, vocab_size=128, n_kv_heads=2, max_context=32, jit=False)
+    with Context(NOOPT=1):   # the optimizer's upcasts exceed 64 registers on some of these kernels; no spilling yet
+      m = Transformer(**cfg)
+      sd = nn.state.get_state_dict(m)
+      for t in sd.values():
+        if t.dtype == dtypes.float and t.numel() > 0: t.replace(Tensor(np.random.default_rng(0).standard_normal(t.shape).astype(np.float32) * 0.05)).realize()
+      w = {k: v.numpy() for k, v in sd.items() if v.dtype == dtypes.float and v.numel() > 0}
+      toks = [[1, 2, 3, 4, 5, 6, 7, 8]]
+      agx_pre = m(Tensor(toks, dtype=dtypes.int32), 0, temperature=math.nan).numpy()          # prefill
+      agx_dec = m(Tensor([[7]], dtype=dtypes.int32), 8, temperature=math.nan).numpy()         # one decode step off the KV cache
+      with Context(DEV="CPU"):
+        m2 = Transformer(**cfg)
+        nn.state.load_state_dict(m2, {k: Tensor(v) for k, v in w.items()}, strict=False, verbose=False)
+        cpu_pre = m2(Tensor(toks, dtype=dtypes.int32), 0, temperature=math.nan).numpy()
+        cpu_dec = m2(Tensor([[7]], dtype=dtypes.int32), 8, temperature=math.nan).numpy()
+    np.testing.assert_allclose(agx_pre, cpu_pre, atol=1e-5)
+    np.testing.assert_allclose(agx_dec, cpu_dec, atol=1e-5)
+
   def test_two_stores(self): # each store followed by STORE_WAIT; the second overwrites the first
     self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nstore r0, 0\nstore r2, 0\n", 1.5, 2.25), 2.25)
 

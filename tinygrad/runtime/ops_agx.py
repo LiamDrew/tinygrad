@@ -182,7 +182,7 @@ class AGXRenderer(Renderer):
         val(v); return vregs[v][k]
       if u.op is Ops.LOAD and (a:=acc_of(u)) is not None: return acc_reg(*a)
       if u in lazy: return emit_load(u)
-      raise RuntimeError(f"AGX renderer: {u.op} has no register")
+      raise RuntimeError(f"AGX renderer: {u.op} has no register (dtype {u.dtype}, srcs {[x.op for x in u.src]}, arg {u.arg})")
     vregs:dict[UOp, list[int]] = {}   # vector load -> its element registers (a block, or scattered scalar loads when no block is free)
     def emit_load(u:UOp) -> int:
       ix, n = u.src[0], vcount(u)
@@ -195,6 +195,11 @@ class AGXRenderer(Renderer):
       else:
         d = alloc_int(u) if is_int(u) else alloc(u); lines.append(f"load r{d}, {sl}, r{base}" + (f", #{off}" if off else ""))
       reg[u] = d
+      if len(u.src) > 2:   # gated load LOAD(addr, alt, gate): the hardware has no predicated load, so select afterwards
+        alt, gate = u.src[1], u.src[2]
+        rg = val(gate); rz = alloc_scratch(u); lines.append(f"movimm r{rz}, #0x00000000")
+        alts = [val(x) for x in strip(alt).src] if n > 1 else [val(alt)]
+        for k, r in enumerate(vregs[u] if n > 1 else [d]): lines.append(f"isel r{r}, r{rz}, r{rg}, r{r}, r{alts[k]}")
       return d
     def fsrc(u:UOp) -> str: # float operand: E4M3 immediate or register
       return f"#{float(cval(u))}" if cval(u) is not None and is_e4m3(cval(u)) else f"r{val(u)}"
@@ -233,6 +238,16 @@ class AGXRenderer(Renderer):
       k = cval(ix.src[1]); assert k is not None, "register accumulators need constant indices (they are registers, not memory)"
       return b, k
     def acc_reg(b:UOp, k:int) -> int: return acc_regs[b][k]
+    def vec_base(u:UOp, v:UOp, n:int) -> int:   # first of n consecutive registers holding v's elements, copying into a block if scattered
+      sv = strip(v)
+      if sv.op is Ops.STACK: vs = [val(x) for x in sv.src]     # a stack of n scalars
+      else: val(sv); vs = list(vregs[sv])                      # a vector value (vector load, WMMA result) that already owns n registers
+      assert len(vs) == n, f"storing {n} elements but the value has {len(vs)}"
+      if any(r != vs[0] + k for k, r in enumerate(vs)):
+        b = alloc_block(u, n)
+        for k, r in enumerate(vs): lines.append(f"ior r{b + k}, r{r}, r{r}")
+        vs = [b + k for k in range(n)]
+      return vs[0]
     def local_of(u:UOp) -> UOp|None: # the LOCAL buffer behind a load/store's index, or None
       b = strip(u.src[0].src[0]); return b if b.op is Ops.BUFFER and b.arg.addrspace is AddrSpace.LOCAL else None
 
@@ -268,12 +283,16 @@ class AGXRenderer(Renderer):
         ix = u.src[0]
         if (acc:=acc_of(u)) is not None: reg[u] = acc_reg(*acc)  # accumulator read: alias
         elif (lb:=local_of(u)) is not None:
-          base, off = idx_split(ix.src[1]); d = alloc(u); reg[u] = d; lines.append(f"tgload r{d}, r{base}, #{off + local_base[lb]}")
+          base, off = idx_split(ix.src[1]); n = vcount(u)
+          d = alloc_block(u, n) if n > 1 else alloc(u); reg[u] = d
+          if n > 1: vregs[u] = [d + k for k in range(n)]
+          lines.append(f"tgload{n if n > 1 else ''} r{d}, r{base}, #{off + local_base[lb]}")
         elif u not in lazy and u not in split: emit_load(u)     # lazy loads are emitted by val() at their first use
       elif u.op is Ops.STORE:
         ix, v = u.src[0], u.src[1]
         if (lb:=local_of(u)) is not None:
-          base, off = idx_split(ix.src[1]); lines.append(f"tgstore r{val(v)}, r{base}, #{off + local_base[lb]}")
+          base, off = idx_split(ix.src[1]); n = vcount(u)
+          lines.append(f"tgstore{n if n > 1 else ''} r{vec_base(u, v, n) if n > 1 else val(v)}, r{base}, #{off + local_base[lb]}")
         elif (acc:=acc_of(u)) is not None:                      # accumulator write
           ra = acc_reg(*acc)
           if cval(v) is not None and ra >= 64:   # far-bank accumulator init: movimm cannot reach it; shift-move from a low register
@@ -283,8 +302,11 @@ class AGXRenderer(Renderer):
         else:
           assert v.dtype.itemsize == 4, f"only 32-bit stores for now, not {v.dtype} (float16/bfloat16 are not supported: dsl.DTYPES)"
           n = vcount(u)
-          if n > 1:   # STACK of n values: consecutive registers already (accumulator elements) or moved into a fresh block
-            vs = [val(s) for s in strip(v).src]; assert len(vs) == n
+          if n > 1:   # a STACK of n scalars, or a vector value (a vector load / WMMA result) that already owns n registers
+            sv = strip(v)
+            if sv.op is Ops.STACK: vs = [val(s) for s in sv.src]
+            else: val(sv); vs = list(vregs[sv])
+            assert len(vs) == n, f"storing {n} elements but the value has {len(vs)}"
             if any(r != vs[0] + k for k, r in enumerate(vs)):
               b = alloc_block(u, n)
               for k, r in enumerate(vs): lines.append(f"ior r{b + k}, r{r}, r{r}")
