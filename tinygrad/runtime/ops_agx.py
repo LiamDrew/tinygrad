@@ -176,6 +176,11 @@ class AGXRenderer(Renderer):
         ra, rb = val(u.src[0]), val(u.src[1])
         mn = "icmp.ult" if u.op is Ops.CMPLT and u.src[0].dtype in dtypes.uints else INT2[u.op]
         d = alloc(u); reg[u] = d; lines.append(f"{mn} r{d}, r{ra}, r{rb}")
+      elif u.op in {Ops.SHL, Ops.SHR} and is_int(u):
+        mn = "ishl" if u.op is Ops.SHL else "ushr" if u.dtype in dtypes.uints else "ishr"
+        ra, n = val(u.src[0]), cval(u.src[1])
+        cnt = f"#{n}" if n is not None and 0 <= n < 32 else f"r{val(u.src[1])}"
+        d = alloc(u); reg[u] = d; lines.append(f"{mn} r{d}, r{ra}, {cnt}")
       elif u.op is Ops.NEG and is_int(u):
         ra = val(u.src[0]); d = alloc(u); reg[u] = d; lines.append(f"ineg r{d}, r{ra}")
       elif u.op is Ops.WHERE and is_int(u):

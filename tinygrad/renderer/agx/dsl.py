@@ -140,7 +140,8 @@ KILL_MODEL = """Operand kill bits are real semantics, not hints (hardware-verifi
 register reads as 0. Apple's compiler sets them on the last use of every value (register release). Ours: the assembler sets none by default; a
 value read twice (fadd r4, r0, r2 / fadd r6, r0, r2) came back 0 while every kill bit was set. Kill bits found so far: FALU/FMA killa, killb;
 FMA c_hi (its register c); LOAD/STORE byte5 bit7 (areg); IADD/ISUB/INEG byte8 bits 1,2; IMUL_RR byte9 bits 1,2; the 0x0b bitwise and 0x02
-min/max/select/compare families byte2 bits 3,4 (FALU layout), ISEL c byte4 bit7 and e byte8 bit7. Every probe-derived template must be checked
+min/max/select/compare families byte2 bits 3,4 (FALU layout), ISEL c byte4 bit7 and e byte8 bit7; 12-byte shifts byte9 bits 0 (value) and 1
+(count); 10-byte arithmetic shifts byte7 bits 6 (value) and 7 (count). Every probe-derived template must be checked
 by running the op twice on the same operands. The old renderer only survived because every register was read exactly once."""
 # float ALU. 4-byte form: [09 | dst<<4] [srcb] [mod] [srca]. mod bit2 adds the two-byte tail (FALU_LONG); mod bit1 adds an fma third operand.
 # destination registers: the 4-bit nibble in byte 0 holds bits [3:0]; bits [5:4] sit in the mod byte's top two bits (probes/live24, live48:
@@ -186,6 +187,20 @@ INEG = Inst("ineg", bytes.fromhex("1f015600020000881104"), (Field("dst", B(3, 1)
 IMUL_RR = Inst("imul", bytes.fromhex("9f00560002000000d0200a00"), (
   Field("dst", B(3, 1), 7), Field("breg", B(5, 2), 6), Field("a", B(6, 3), 5), Field("killb", B(9, 1), 1), Field("killa", B(9, 2), 1)),
   doc="dst = a * b (32-bit); IMUL is the thread-index-times-stride form. Apple's byte 9 = 26: both operands killed")
+# shifts (probes/int/ishl_imm*, ishr_imm*, ushr_imm*, *_reg): a 12-byte family. byte 0: 27 = left, a7 = right; byte 1 bit 0 = arithmetic, bit 4 = count in
+# a register; byte 5 = value register << 2; byte 6 = count << 2 (immediate) or count register << 3; byte 9 bit 0 kills the value, bit 1 the count.
+# Counts of 32 and up give 0 (Apple masks with & 31 first). Apple emits shift-add pairs for small left shifts and half-register moves for 16.
+_SHF = (Field("dst", B(3, 1), 7), Field("a", B(5, 2), 6), Field("killa", B(9, 0), 1))
+SHL_IMM  = Inst("ishl", bytes.fromhex("270056000200000 0f0100100".replace(" ", "")), _SHF + (Field("n", B(6, 2), 5),), doc="dst = a << n")
+LSHR_IMM = Inst("ushr", bytes.fromhex("a70056000200000 0f0100100".replace(" ", "")), _SHF + (Field("n", B(6, 2), 5),), doc="dst = a >> n, logical")
+# arithmetic right by an immediate is Apple's 10-byte form: its kill bit is byte 7 bit 6 (78 -> 38). The 12-byte a7 01 layout only worked with its kill set.
+ASHR_IMM = Inst("ishr", bytes.fromhex("a70156000200003862 00".replace(" ", "")), (Field("dst", B(3, 1), 7), Field("a", B(5, 2), 6), Field("n", B(6, 2), 5), Field("killa", B(7, 6), 1)),
+  doc="dst = a >> n, arithmetic")
+SHL_REG  = Inst("ishl", bytes.fromhex("271056000200000 0f0100500".replace(" ", "")), _SHF + (Field("breg", B(6, 3), 5), Field("killb", B(9, 1), 1)), doc="dst = a << b")
+LSHR_REG = Inst("ushr", bytes.fromhex("a71056000200000 0f0100500".replace(" ", "")), _SHF + (Field("breg", B(6, 3), 5), Field("killb", B(9, 1), 1)), doc="dst = a >> b, logical")
+ASHR_REG = Inst("ishr", bytes.fromhex("a7115600020000 18e200".replace(" ", "")), (Field("dst", B(3, 1), 7), Field("a", B(5, 2), 6), Field("breg", B(6, 3), 5),
+  Field("killa", B(7, 6), 1), Field("killb", B(7, 7), 1)), doc="dst = a >> b, arithmetic (10-byte form like ASHR_IMM; Apple: d8 = both killed)")
+SHIFTS = {("ishl", False): SHL_IMM, ("ushr", False): LSHR_IMM, ("ishr", False): ASHR_IMM, ("ishl", True): SHL_REG, ("ushr", True): LSHR_REG, ("ishr", True): ASHR_REG}
 # the 0x0b bitwise family, 10 bytes: FALU-style operands (byte 1 = srcb, byte 3 = srca, dst nibble + DST_HI), byte 2 bits 3,4 = kills. Bytes 2, 4, 5
 # select the function (Apple: and 1f/00 00, or 1f/02 08, xor 1e/02 08 with the kills set); byte 5 is not an operand (moving b left it unchanged).
 _BIT = lambda name, hexs, doc: Inst(name, bytes.fromhex(hexs), (Field("dst", B(0, 4), 4), Field("srcb", B(1), 8), Field("killb", B(2, 3), 1), Field("killa", B(2, 4), 1),
@@ -235,7 +250,7 @@ STORE_WAIT = Inst("store_wait", bytes.fromhex("110000901100"),
   doc="wait for the preceding store. Apple emits one after every store; two stores back to back lose data without it (test_agx)")
 BARRIER = STORE_WAIT # old name
 
-TABLE = (LOAD, IADD, ISUB, INEG, IMUL_RR, IAND, IOR, IXOR, IMAX, IMIN, ISEL4, ISEL, ICMP, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
+TABLE = (LOAD, SHL_IMM, LSHR_IMM, ASHR_IMM, SHL_REG, LSHR_REG, ASHR_REG, IADD, ISUB, INEG, IMUL_RR, IAND, IOR, IXOR, IMAX, IMIN, ISEL4, ISEL, ICMP, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
 
 def movimm_bits_fields(v:int) -> dict[str, int]: return {n: (v >> lo) & ((1 << w) - 1) for n, lo, w in _MOVIMM_SLICES}
 def movimm_fields(f:float) -> dict[str, int]: return movimm_bits_fields(struct.unpack("<I", struct.pack("<f", f))[0])
@@ -266,6 +281,7 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
     c = f"#{'-' if d['c_hi'] else ''}{e4m3_value(d['c'] | 1):g}" if d["c_imm"] else f"{'-' if d['c_neg'] else ''}r{d['c'] >> 1}"
     return f"fma r{dst_reg(d)}, {'-' if d['negp'] else ''}{a}, r{operand_reg(d['srcb'])}, {c}" + "".join(f" ; {n}" for n in ("killa", "killb", "fwd") if d[n])
   if inst is MOVIMM: return f"movimm r{dst_reg(d)}, #{movimm_value(d):g}"
+  if inst in SHIFTS.values(): return f"{inst.mnemonic} r{d['dst']}, r{d['a']}, " + (f"r{d['breg']}" if "breg" in d else f"#{d['n']}") + "".join(f" ; {n}" for n in ("killa", "killb") if d.get(n))
   if inst is IADD: return f"iadd r{d['dst']}, r{d['a']}, r{d['breg']}"
   if inst is ISUB: return f"isub r{d['dst']}, r{d['breg']}, r{d['a']}"
   if inst is INEG: return f"ineg r{d['dst']}, r{d['a']}"

@@ -47,6 +47,8 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
     self.assertEqual([t for _, t in body], ["isub r4, r0, r2", "ineg r5, r0", "imul r6, r0, r2", "iand r7, r0, r2", "ior r8, r0, r2", "ixor r9, r0, r2",
                                             "imax r10, r0, r2", "imin r22, r0, r2", "isel r12, r0, r2, r4, r0", "isel r13, r0, r2, r4, r5",
                                             "icmp.lt r14, r0, r2", "icmp.ne r30, r0, r2"])
+    text, _, _ = asm.assemble_text("load r0, 1\nwait\nload r2, 2\nwait\nishl r4, r0, #5\nishr r5, r2, #3\nushr r6, r0, #1\nishl r7, r0, r2\nishr r8, r2, r0\nushr r9, r0, r2\nstore r4, 0\n")
+    self.assertEqual([t for _, _, t in dsl.disassemble(text)][6:-3], ["ishl r4, r0, #5", "ishr r5, r2, #3", "ushr r6, r0, #1", "ishl r7, r0, r2", "ishr r8, r2, r0", "ushr r9, r0, r2"])
     self.assertEqual(body[0][0], "1f01560802001 0a81105".replace(" ", ""))   # verified on hardware: a - b into r4, kill bits clear (Apple: 17)
     self.assertEqual(body[3][0], "7b050701000000800000")                     # and, kill bits clear (07, Apple: 1f)
 
@@ -120,6 +122,13 @@ class TestAGX(unittest.TestCase):
                       ("icmp.eq r4, r0, r2\nstore r4, 0\n", 0), ("icmp.ne r4, r0, r2\nstore r4, 0\n", 1)]:
       with self.subTest(src=src.split("\n")[0]): self.assertEqual(self.run_asm_int(src, 5, 3), want)
 
+  def test_int_shifts(self): # probes/int/ishl_imm*.metal and friends; value in r0 or r2, count immediate or in a register
+    for a, b, src, want in [(5, 3, "ishl r4, r0, #5\nstore r4, 0\n", 160), (5, 3, "ishl r4, r0, #16\nstore r4, 0\n", 327680), (3, 5, "ishl r4, r2, #2\nstore r4, 0\n", 20),
+                            (-16, 3, "ishr r4, r0, #3\nstore r4, 0\n", -2), (-16, 3, "ushr r4, r0, #3\nstore r4, 0\n", 536870910),
+                            (5, 3, "ishl r4, r0, r2\nstore r4, 0\n", 40), (-16, 3, "ishr r4, r0, r2\nstore r4, 0\n", -2), (-16, 3, "ushr r4, r0, r2\nstore r4, 0\n", 536870910),
+                            (5, 3, "ishl r4, r0, r2\nishl r6, r0, r2\nstore r6, 0\n", 40)]:   # operands survive (no kill bits)
+      with self.subTest(a=a, b=b, src=src.split("\n")[0]): self.assertEqual(self.run_asm_int(src, a, b), want)
+
   def test_int_compare_select(self):
     for a, b, src, want in [(3, 5, "icmp.lt r4, r0, r2\nstore r4, 0\n", 1), (5, 3, "icmp.lt r4, r0, r2\nstore r4, 0\n", 0), (-1, 5, "icmp.lt r4, r0, r2\nstore r4, 0\n", 1),
                             (-1, 5, "icmp.ult r4, r0, r2\nstore r4, 0\n", 0), (3, 3, "icmp.eq r4, r0, r2\nstore r4, 0\n", 1),
@@ -135,7 +144,8 @@ class TestAGX(unittest.TestCase):
       for name, t, want in [("sub", a - b, [x - y for x, y in zip(A, B)]), ("mul", a * b, [x * y for x, y in zip(A, B)]), ("and", a & b, [x & y for x, y in zip(A, B)]),
                             ("or", a | b, [x | y for x, y in zip(A, B)]), ("xor", a ^ b, [x ^ y for x, y in zip(A, B)]), ("max", a.maximum(b), [max(x, y) for x, y in zip(A, B)]),
                             ("where", (a < b).where(a, b), [x if x < y else y for x, y in zip(A, B)]),
-                            ("ne", (a != b).cast(dtypes.int32), [int(x != y) for x, y in zip(A, B)]), ("mul7", a * 7, [x * 7 for x in A])]:
+                            ("ne", (a != b).cast(dtypes.int32), [int(x != y) for x, y in zip(A, B)]), ("mul7", a * 7, [x * 7 for x in A]),
+                            ("shl", a << 5, [x << 5 for x in A]), ("shr", a >> 1, [x >> 1 for x in A]), ("shl_reg", a << (b & 3), [x << (y & 3) for x, y in zip(A, B)])]:
         with self.subTest(op=name): self.assertEqual(t.tolist(), want)
 
   def test_kill_model(self): # dsl.KILL_MODEL: with no kill bits set, a register can be read again after an op, a load and a store
