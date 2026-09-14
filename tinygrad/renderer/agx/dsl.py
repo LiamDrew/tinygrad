@@ -124,8 +124,7 @@ Apple's later six-byte ops carry tails 00 20 / 00 40; those do not work as the f
 FALU = Inst("falu", bytes.fromhex("09000000"), (
   Field("dst", B(0, 4), 4),         # destination register r0..r15 (probes/sums_live.metal)
   Field("srcb", B(1), 8),           # register operand, or E4M3 immediate when bmode has bit 7
-  Field("mul", B(2, 0), 1),         # 0 = fadd, 1 = fmul (probes/fmul.metal)
-  Field("fma", B(2, 1), 1),         # three-operand form, 8 bytes (probes/mul_add.metal), not encodable here yet
+  Field("mul", B(2, 0), 1),         # 0 = fadd, 1 = fmul (probes/fmul.metal); mod bit1 (fixed 0 here) selects FMA
   Field("killb", B(2, 3), 1),       # srcb dies after this op (compiler hint; every probe agrees, semantics unverified)
   Field("killa", B(2, 4), 1),       # srca dies after this op
   Field("fwd", B(2, 5), 1),         # result feeds another ALU op rather than a store
@@ -134,6 +133,18 @@ FALU = Inst("falu", bytes.fromhex("09000000"), (
 FALU_LONG = Inst("falu", bytes.fromhex("090004000000"), tuple(FALU.fields) + (Field("ext", B(4), 8), Field("tag", B(5), 8)),
   doc="six-byte float ALU: byte4 = 0, or 0x80 for an immediate srcb; tail byte 0xc0 = wait for outstanding loads (LOAD_WAIT_MODEL)")
 FALU_IMM_NEG, FALU_IMM_ADD = 1, 0    # for an E4M3 immediate srcb the sign lives in killb: 0x14 = add, 0x1c = negate (prog_add vs probes)
+# fused multiply-add, 8 bytes: dst = (+-)(srca * srcb) + (+-)c. Hardware-verified (test_agx) for register/immediate c, negated c,
+# negated product, immediate srca, and dst != r0. byte4: bit5 = c is an E4M3 immediate, bit4 = negate register c, bit7 = set for a
+# register c or a negated immediate c (probes/mul_add.metal and friends). byte7: bit3 = negate the product, bit1 = srca is an immediate.
+FMA = Inst("fma", bytes.fromhex("090006000100 02c0"), (
+  Field("dst", B(0, 4), 4),
+  Field("srcb", B(1), 8),
+  Field("killb", B(2, 3), 1), Field("killa", B(2, 4), 1), Field("fwd", B(2, 5), 1),
+  Field("srca", B(3), 8),
+  Field("c_hi", B(4, 7), 1), Field("c_imm", B(4, 5), 1), Field("c_neg", B(4, 4), 1),
+  Field("c", B(5), 8),              # register << 1, or E4M3 immediate without its low bit
+  Field("negp", B(7, 3), 1), Field("aimm", B(7, 1), 1)),
+  doc="dst = srca * srcb + c")
 MOVIMM = Inst("movimm", bytes.fromhex("0c80020000000000"), (
   Field("hi7", B(3, 1), 7),         # fp32 bits[31:25]
   Field("mid21", B(4, 3), 21),      # fp32 bits[20:0]
@@ -147,7 +158,7 @@ STORE_WAIT = Inst("store_wait", bytes.fromhex("110000901100"),
   doc="wait for the preceding store. Apple emits one after every store; two stores back to back lose data without it (test_agx)")
 BARRIER = STORE_WAIT # old name
 
-TABLE = (LOAD_IDX, LOAD, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
+TABLE = (LOAD_IDX, LOAD, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
 
 def movimm_fields(f:float) -> dict[str, int]:
   v = struct.unpack("<I", struct.pack("<f", f))[0]
@@ -171,9 +182,13 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
   if inst is STORE: return f"store r{d['src']}, {d['slot']}" + "".join(f" ; {n}" for n in ("first", "wait", "last") if d[n])
   if inst is FALU or inst is FALU_LONG:
     op, dst, a = "fmul" if d["mul"] else "fadd", f"r{d['dst']}", f"r{operand_reg(d['srca'])}"
-    flags = "".join(f" ; {n}" for n in ("fma", "killa", "killb", "fwd") if d[n]) + (f" ; tag {d['tag']:02x}" if inst is FALU_LONG and d["tag"] != 0xc0 else "")
+    flags = "".join(f" ; {n}" for n in ("killa", "killb", "fwd") if d[n]) + (f" ; tag {d['tag']:02x}" if inst is FALU_LONG and d["tag"] != 0xc0 else "")
     if inst is FALU_LONG and d["ext"] & 0x80: return f"{op} {dst}, {a}, #{'-' if d['killb'] else ''}{e4m3_value(d['srcb']):g}{flags}"
     return f"{op} {dst}, {a}, r{operand_reg(d['srcb'])}{flags}"
+  if inst is FMA:
+    a = f"#{e4m3_value(d['srca'] | 1):g}" if d["aimm"] else f"r{operand_reg(d['srca'])}"
+    c = f"#{'-' if d['c_hi'] else ''}{e4m3_value(d['c'] | 1):g}" if d["c_imm"] else f"{'-' if d['c_neg'] else ''}r{d['c'] >> 1}"
+    return f"fma r{d['dst']}, {'-' if d['negp'] else ''}{a}, r{operand_reg(d['srcb'])}, {c}" + "".join(f" ; {n}" for n in ("killa", "killb", "fwd") if d[n])
   if inst is MOVIMM: return f"movimm r{d['dst']}, #{movimm_value(d):g}"
   return inst.mnemonic
 

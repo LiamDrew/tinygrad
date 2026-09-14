@@ -25,6 +25,13 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
       inst = next(i for i in dsl.TABLE if i.matches(b))
       self.assertEqual(dsl.fmt(inst, inst.decode(b)), want, hexs)
 
+  def test_fma_decodes_apple(self): # bytes from probes: b0*b1 + b2 and variants
+    for hexs, want in [("09011e05810802c0", "fma r0, r2, r0, r4 ; killa ; killb"), ("09011e05910802c0", "fma r0, r2, r0, -r4 ; killa ; killb"),
+                       ("09011e0521b002c0", "fma r0, r2, r0, #1 ; killa ; killb"), ("09011e05a1b002c0", "fma r0, r2, r0, #-1 ; killa ; killb"),
+                       ("09051e01910802c8", "fma r0, -r0, r2, -r4 ; killa ; killb"), ("09010ec1810402c2", "fma r0, #2, r0, r2 ; killb")]:
+      b = bytes.fromhex(hexs); inst = next(i for i in dsl.TABLE if i.matches(b))
+      self.assertEqual((inst.size, dsl.fmt(inst, inst.decode(b))), (8, want), hexs)
+
   def test_immediates(self):
     text, _, _ = asm.assemble_text("movimm r0, #42.0\nfadd r0, r0, #-3.5\nstore r0, 0\n")
     body = [t for _, _, t in dsl.disassemble(text)]
@@ -114,6 +121,14 @@ class TestAGX(unittest.TestCase):
     self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nfadd r0, r0, #1.0\nfadd r0, r0, r2\nfmul r0, r0, r0\nstore r0, 0\n", 1.5, 2.25), 22.5625)
     # one waiting op on r0 covers r2 too: store r2 plainly afterwards
     self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nfadd r4, r0, #1.0\nstore r2, 0\n", 1.5, 2.25), 2.25)
+
+  def test_fma(self): # dst = a*b + c on hardware, through the assembler
+    k = ".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\n%s\nstore r4, 0\n"
+    self.assertEqual(self.run_asm(k % "fma r4, r0, r2, r2", 1.5, 2.25), 5.625)
+    self.assertEqual(self.run_asm(k % "fma r4, r0, r2, -r2", 1.5, 2.25), 1.125)
+    self.assertEqual(self.run_asm(k % "fma r4, r0, r2, #1.0", 1.5, 2.25), 4.375)
+    self.assertEqual(self.run_asm(k % "fma r4, r0, r2, #-3.0", 1.5, 2.25), 0.375)
+    self.assertEqual(self.run_asm(k % "fma r4, #2.0, r0, r2", 1.5, 2.25), 5.25)
 
   def test_two_stores(self): # each store followed by STORE_WAIT; the second overwrites the first
     self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nstore r0, 0\nstore r2, 0\n", 1.5, 2.25), 2.25)

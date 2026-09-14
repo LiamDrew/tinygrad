@@ -29,6 +29,15 @@ def i_falu_imm(dst,a,imm,mul=0,wait=True): # an immediate needs the six-byte for
 def i_falu_reg(dst,a,bb,mul=0,wait=True): # waiting (six-byte, tail c0) for the first consumer of loads, else the four-byte form, like Apple
     if wait: return dsl.FALU_LONG.encode(dst=dst, srcb=dsl.reg_operand(bb), mul=mul, killa=1, killb=1, srca=dsl.reg_operand(a), tag=0xc0)
     return dsl.FALU.encode(dst=dst, srcb=dsl.reg_operand(bb), mul=mul, killa=1, killb=1, srca=dsl.reg_operand(a))
+def i_fma(dst, a, b, c): # fma rD, rA|#imm, rB, rC|#imm|-rC : rD = rA*rB + rC  (always the waiting tail c0)
+    kw = dict(dst=dst, srcb=dsl.reg_operand(b), killa=1, killb=1)
+    if a.startswith('#'): kw.update(srca=dsl.e4m3(float(a[1:]))[0], aimm=1, killa=0)
+    else: kw.update(srca=dsl.reg_operand(reg(a)))
+    if c.startswith('#'):
+        e, neg = dsl.e4m3(float(c[1:])); kw.update(c=e & ~1, c_imm=1, c_hi=int(neg))
+    else:
+        neg = c.startswith('-'); kw.update(c=reg(c.lstrip('-')) << 1, c_hi=1, c_neg=int(neg))
+    return dsl.FMA.encode(**kw)
 def i_store(srcreg, slot, first=False, wait=False, last=False): # every store is followed by its wait, like Apple
     return dsl.STORE.encode(first=int(first), wait=int(wait), src=srcreg, slot=slot, last=int(last)) + dsl.STORE_WAIT.encode()
 def movimm_bytes(dst, f): return dsl.MOVIMM.encode(dst=dst, **dsl.movimm_fields(f))
@@ -75,6 +84,8 @@ def assemble_text(program):
             else:
                 main+=i_falu_reg(d,a,reg(p[3]),mul,wait=pending)
             pending=False
+        elif op=='fma':                                  # fma rD, rA, rB, rC
+            main+=i_fma(reg(p[1]), p[2], reg(p[3]), p[4]); pending=False
         elif op=='movimm':
             d=reg(p[1]); main+=movimm_bytes(d,float(p[2].lstrip('#')))
         elif op=='store':
