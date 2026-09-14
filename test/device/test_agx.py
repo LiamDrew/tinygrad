@@ -11,7 +11,7 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
     self.assertEqual((n, written), (3, {0}))
     body = [t for _, _, t in dsl.disassemble(text)]
     self.assertEqual(body, [".preamble 64 bytes", "get_tid", "load r0, 1 ; first ; more", "wait", "load r2, 2", "wait", "fadd r4, r0, r2 ; killa ; killb",
-                            "store r4, 0", "barrier", "stop"])
+                            "store r4, 0 ; last", "store_wait", "stop"])
     self.assertFalse(any(t.startswith(".short") for t in body), "every emitted byte decodes")
 
   def test_apple_bytes_decode(self): # bytes captured from probes/*.metal
@@ -20,7 +20,7 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
                        ("c9110015", "fadd r12, r10, r8"),                                        # sums_live: 4-byte form, explicit dst
                        ("3905040100c0", "fadd r3, r0, r2"),                                      # keep_inputs: odd dst
                        ("09c9140180c0", "fadd r0, r0, #3 ; killa"),                              # add_const: E4M3 immediate
-                       ("6700440400012000", "load r2, 0"), ("e70054080001210 0".replace(" ", ""), "store r4, 0")]:
+                       ("6700440400012000", "load r2, 0"), ("e700540800012100", "store r4, 0 ; last"), ("e700560000012000", "store r0, 0 ; wait")]:
       b = bytes.fromhex(hexs)
       inst = next(i for i in dsl.TABLE if i.matches(b))
       self.assertEqual(dsl.fmt(inst, inst.decode(b)), want, hexs)
@@ -67,6 +67,9 @@ class TestAGX(unittest.TestCase):
     self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nfadd r0, r0, #1.0\nfadd r0, r0, r2\nfmul r0, r0, r0\nstore r0, 0\n", 1.5, 2.25), 22.5625)
     # one waiting op on r0 covers r2 too: store r2 plainly afterwards
     self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nfadd r4, r0, #1.0\nstore r2, 0\n", 1.5, 2.25), 2.25)
+
+  def test_two_stores(self): # each store followed by STORE_WAIT; the second overwrites the first
+    self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nstore r0, 0\nstore r2, 0\n", 1.5, 2.25), 2.25)
 
   def test_operand_order(self): # subtraction would tell a from b; with add/mul only, check srca and srcb both read the right registers
     self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nfadd r4, r2, r0\nstore r4, 0\n", 1.5, 2.25), 3.75)

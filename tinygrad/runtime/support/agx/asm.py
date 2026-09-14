@@ -15,11 +15,12 @@ def i_falu_imm(dst,a,imm,mul=0,wait=True): # an immediate needs the six-byte for
 def i_falu_reg(dst,a,bb,mul=0,wait=True): # waiting (six-byte, tail c0) for the first consumer of loads, else the four-byte form, like Apple
     if wait: return dsl.FALU_LONG.encode(dst=dst, srcb=dsl.reg_operand(bb), mul=mul, killa=1, killb=1, srca=dsl.reg_operand(a), tag=0xc0)
     return dsl.FALU.encode(dst=dst, srcb=dsl.reg_operand(bb), mul=mul, killa=1, killb=1, srca=dsl.reg_operand(a))
-def i_store(srcreg, slot, first=False, wait=False): return dsl.STORE.encode(first=int(first), wait=int(wait), src=srcreg, slot=slot)
+def i_store(srcreg, slot, first=False, wait=False, last=False): # every store is followed by its wait, like Apple
+    return dsl.STORE.encode(first=int(first), wait=int(wait), src=srcreg, slot=slot, last=int(last)) + dsl.STORE_WAIT.encode()
 def movimm_bytes(dst, f): return dsl.MOVIMM.encode(dst=dst, **dsl.movimm_fields(f))
 
 PREAMBLE_IDX = bytes.fromhex('030007000200000060000e000000')  # thread-index preamble
-EPILOGUE     = dsl.BARRIER.encode() + dsl.STOP.encode()
+EPILOGUE     = dsl.STOP.encode() # the last store's wait precedes it
 
 def assemble_text(program):
     """Return (text_bytes, N, written slots). Builds preamble(0..0x40) + main + epilogue."""
@@ -33,8 +34,8 @@ def assemble_text(program):
         op=p[0]
         if op=='.buffers': N=int(p[1]); continue
         body.append(p)
-    total_loads=sum(1 for p in body if p[0]=='load')
-    for p in body:
+    total_loads=sum(1 for p in body if p[0]=='load'); last_store=max((i for i,p in enumerate(body) if p[0]=='store'), default=-1)
+    for bi,p in enumerate(body):
         op=p[0]
         if op=='load':
             d=reg(p[1]); slot=int(p[2]); N=max(N,slot+1)
@@ -52,7 +53,7 @@ def assemble_text(program):
             d=reg(p[1]); main+=movimm_bytes(d,float(p[2].lstrip('#')))
         elif op=='store':
             s=reg(p[1]); slot=int(p[2]); N=max(N,slot+1); written.add(slot)
-            main+=i_store(s,slot, first=not seen_mem, wait=pending); seen_mem=True; pending=False
+            main+=i_store(s,slot, first=not seen_mem, wait=pending, last=bi==last_store); seen_mem=True; pending=False
         else:
             raise ValueError(f"unknown op {op}")
     main+=EPILOGUE
