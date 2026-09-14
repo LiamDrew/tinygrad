@@ -69,6 +69,22 @@ LOAD = Inst("load", bytes.fromhex("6700440000012000"), (
   Field("dst", B(3, 1), 7),         # destination register (reg_field)
   Field("slot", B(4), 8)),          # dense buffer binding index
   doc="dst = buf[slot][thread_index] (32-bit)")
+LOAD_IDX = Inst("load", bytes.fromhex("6700440000802000"), (
+  Field("first", B(1, 4), 1),
+  Field("more", B(2, 4), 1),
+  Field("dst", B(3, 1), 7),
+  Field("slot", B(4), 8),
+  Field("areg", B(5, 0), 7)),       # element offset register (32-bit); byte5 bit7 selects this mode (probes/off1.metal, r0 busy -> 82)
+  doc="dst = buf[slot][areg] (32-bit): base of slot plus an element offset from a register, no thread index")
+# element offset from the thread index: dst = (t << shift) + imm. byte 5 = imm<<1 (probes: +1 -> 02, +100 -> c8); shift bit0 in byte7 bit6,
+# bit1 in byte9 bit4 (2t -> c8/04, 4t -> 88/14, 8t -> c8/14); byte8 bit0 is set when there is no shift. Other bytes fixed; meaning unknown.
+ADDR = Inst("addr", bytes.fromhex("9f11540002000888 1004".replace(" ", "")), (
+  Field("dst", B(3, 1), 7),
+  Field("imm", B(5, 1), 7),
+  Field("shift0", B(7, 6), 1),
+  Field("noshift", B(8, 0), 1),
+  Field("shift1", B(9, 4), 1)),
+  doc="dst = (thread_index << shift) + imm, an element offset for LOAD_IDX")
 STORE = Inst("store", bytes.fromhex("e700540000012000"), (
   Field("first", B(1, 4), 1),       # set when no load preceded (probes/movimm.metal)
   Field("wait", B(2, 1), 1),        # wait for outstanding loads first (0x56). Required on the first consumer of load data, see LOAD_WAIT_MODEL
@@ -110,7 +126,7 @@ STORE_WAIT = Inst("store_wait", bytes.fromhex("110000901100"),
   doc="wait for the preceding store. Apple emits one after every store; two stores back to back lose data without it (test_agx)")
 BARRIER = STORE_WAIT # old name
 
-TABLE = (LOAD, STORE, WAIT, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
+TABLE = (LOAD_IDX, LOAD, ADDR, STORE, WAIT, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
 
 def movimm_fields(f:float) -> dict[str, int]:
   v = struct.unpack("<I", struct.pack("<f", f))[0]
@@ -121,6 +137,8 @@ def movimm_value(d:dict[str, int]) -> float:
 # ---- disassembler -----------------------------------------------------------------------------------------------------------------
 def fmt(inst:Inst, d:dict[str, int]) -> str:
   if inst is LOAD: return f"load r{d['dst']}, {d['slot']}" + (" ; first" if d["first"] else "") + (" ; more" if d["more"] else "")
+  if inst is LOAD_IDX: return f"load r{d['dst']}, {d['slot']}, r{d['areg']}" + (" ; first" if d["first"] else "") + (" ; more" if d["more"] else "")
+  if inst is ADDR: return f"addr r{d['dst']}, {d['shift0'] | d['shift1'] << 1}, #{d['imm']}" + (" ; noshift" if d["noshift"] else "")
   if inst is STORE: return f"store r{d['src']}, {d['slot']}" + "".join(f" ; {n}" for n in ("first", "wait", "last") if d[n])
   if inst is FALU or inst is FALU_LONG:
     op, dst, a = "fmul" if d["mul"] else "fadd", f"r{d['dst']}", f"r{operand_reg(d['srca'])}"

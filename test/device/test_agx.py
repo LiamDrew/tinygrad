@@ -52,6 +52,33 @@ class TestAGX(unittest.TestCase):
       x, y = Tensor([a]).contiguous().realize(), Tensor([b]).contiguous().realize()
       return (x + y).item() # the op here is irrelevant: render is patched
 
+  def run_asm8(self, src:str, a:list[float], b:list[float]) -> list[float]: # 8 threads, data0[t] = f(data1, data2); inputs may be longer
+    from tinygrad.runtime import ops_agx, ops_metal
+    from tinygrad import codegen
+    from tinygrad.runtime.support import hcq2
+    from tinygrad.engine import realize
+    for c in (codegen.to_program_cache, hcq2.hcq_compile_cache, hcq2.link_linear_cache, realize.runtime_cache): c.clear()
+    with patch.object(ops_agx.AGXRenderer, "render", lambda self, uops: src), \
+         patch.object(ops_metal.MetalQueue, "dims", staticmethod(lambda prg: (8, 1, 1, 1, 1, 1))):
+      x, y = Tensor(a).contiguous().realize(), Tensor(b).contiguous().realize()
+      return (x[:8] + y[:8]).contiguous().tolist() if False else (x + y).tolist()[:8]
+
+  def test_addr_offset(self): # addr r0 = t + imm; indexed load through r0 (dsl.ADDR, dsl.LOAD_IDX)
+    a = [float(i) for i in range(16)]
+    self.assertEqual(self.run_asm8(".buffers 3\naddr r0, 0, #1\nload r0, 1, r0\nwait\nstore r0, 0\n", a, a), a[1:9])
+    self.assertEqual(self.run_asm8(".buffers 3\naddr r0, 0, #5\nload r0, 1, r0\nwait\nstore r0, 0\n", a, a), a[5:13])
+
+  def test_addr_shift(self): # addr r0 = t << shift
+    a = [float(i) for i in range(64)]
+    self.assertEqual(self.run_asm8(".buffers 3\naddr r0, 1, #0\nload r0, 1, r0\nwait\nstore r0, 0\n", a, a), a[0:16:2])
+    self.assertEqual(self.run_asm8(".buffers 3\naddr r0, 2, #0\nload r0, 1, r0\nwait\nstore r0, 0\n", a, a), a[0:32:4])
+    self.assertEqual(self.run_asm8(".buffers 3\naddr r0, 3, #1\nload r0, 1, r0\nwait\nstore r0, 0\n", a, a), a[1:64:8])
+
+  def test_addr_register(self): # the offset can live in another register (probe with r0 busy: 9f ... 04 / load byte5 82)
+    a = [float(i) for i in range(16)]
+    self.assertEqual(self.run_asm8(".buffers 3\naddr r2, 0, #1\nload r0, 1, r2\nwait\nstore r0, 0\n", a, a), a[1:9])
+    self.assertEqual(self.run_asm8(".buffers 3\naddr r5, 0, #2\nload r3, 1, r5\nwait\nstore r3, 0\n", a, a), a[2:10])
+
   def test_dst_register(self): # the destination nibble in byte 0 of the float ALU op, verified on hardware
     for d in (0, 1, 3, 4, 7, 15):
       with self.subTest(dst=d):
