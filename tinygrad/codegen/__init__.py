@@ -289,7 +289,9 @@ pm_implicit_barriers = PatternMatcher([
 
 def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   if VIZ: graph_rewrite(ast, PatternMatcher([]), name="View Base AST")
-  if DEBUG >= 5: print(pyrender(ast))
+  if DEBUG >= 5:
+    try: print(pyrender(ast))
+    except NotImplementedError as e: print(f"# {ast.arg.name}: {e}") # hcq submits call kernels and carry buffers
   if SPEC: type_verify(ast, spec_tensor)
 
   # resolve UNSHARDs (multi-device UNSHARDs are already resolved by the scheduler; this handles in-kernel shards, e.g. fragments)
