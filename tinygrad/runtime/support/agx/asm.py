@@ -76,6 +76,11 @@ def assemble_text(program):
             main+=i_imul(reg(p[1]), int(p[2].lstrip('#')))
         elif op=='imul':                                 # imul rD, rA, rB : rD = rA * rB
             main+=dsl.IMUL_RR.encode(dst=reg(p[1]), a=reg(p[2]), breg=reg(p[3])); pending=False
+        elif op=='if':                                   # if rC ... endif : the region runs where rC != 0 (per thread)
+            assert not loops, "if inside a loop is not verified (depth nibble)"
+            main+=dsl.IF_BEGIN.encode(cond=dsl.reg_operand(reg(p[1]))); pending=False
+        elif op=='endif':
+            main+=dsl.IF_END.encode()
         elif op=='getsr':                                # getsr rD, gid.x | lid.y | tid.z | tpg.x ... (dsl.SR)
             main+=dsl.GET_SR.encode(dst=reg(p[1]), sr=dsl.SR[p[2]])
         elif op in dsl.CVTS:                             # i2f|u2f|f2i|f2u rD, rA

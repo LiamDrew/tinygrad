@@ -183,6 +183,15 @@ class TestAGX(unittest.TestCase):
     self.assertEqual(self.run_asm_dims(src % "gid.y", (2, 2, 1, 1, 1, 1))[:4], [0, 0, 1, 1])
     self.assertEqual(self.run_asm_dims(src % "lid.y", (1, 1, 1, 2, 2, 1))[:4], [0, 0, 1, 1])
 
+  def test_if(self): # probes/if: the region runs only where the condition register is nonzero; threads diverge within a SIMD group
+    # 8 threads in one group: out[t] = t != 0 ? 10 + t : 99 (r0 = t from data1 = range(8), r2 = data2 = range(8))
+    src = "load r0, 1\nwait\nload r2, 2\nwait\nmovimm r7, #0x00000063\nmovimm r5, #0x0000000a\niadd r5, r5, r2\nif r0\nior r7, r5, r5\nendif\nstore r7, 0\n"
+    self.assertEqual(self.run_asm_dims(src, (1, 1, 1, 8, 1, 1)), [99] + [10 + t for t in range(1, 8)])
+    self.assertEqual(self.run_asm_dims(src, (8, 1, 1, 1, 1, 1)), [99] + [10 + t for t in range(1, 8)])
+    # after a loop, like tinygrad's guarded final store: r2 doubled 4 times, stored only where t != 0
+    src = "load r0, 1\nwait\nload r2, 2\nwait\nmovimm r7, #0x00000063\nloop r3, #4\nbody\niadd r2, r2, r2\nendloop\nif r0\nior r7, r2, r2\nendif\nstore r7, 0\n"
+    self.assertEqual(self.run_asm_dims(src, (1, 1, 1, 8, 1, 1)), [99] + [16 * t for t in range(1, 8)])
+
   def test_optimized_kernels(self): # the default optimizer: SPECIAL indices, threadgroups, upcasts; no NOOPT
     A = [[float(i * 8 + j) for j in range(8)] for i in range(8)]; B = [[float((i * j) % 5) for j in range(8)] for i in range(8)]
     a, b = Tensor(A).contiguous().realize(), Tensor(B).contiguous().realize()

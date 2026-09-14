@@ -122,6 +122,12 @@ LOOP_ENTER = Inst("loop_enter", bytes.fromhex("07020000"), (Field("extra", B(0, 
 LOOP_TAIL = Inst("loop_tail", bytes.fromhex("8f045422"), (Field("depth4", B(3, 2), 6),), doc="loop control before the back branch; byte3 = 0x22 + 4 * nesting depth")
 BRANCH = Inst("branch", bytes.fromhex("0f00540000000000ff00"), (Field("off", B(3), 40),), doc="pc += off (relative to this instruction's address); 10 bytes")
 LOOP_EXIT = Inst("loop_exit", bytes.fromhex("0f0604020000"), doc="after the loop; stores do not land without it")
+# if (probes/if/*.metal): Apple compares the condition register with 0 (the loop_cmp word with byte 2 bit 3 = "not equal", n = 0), then
+# 06 00 | 07 c2 00 00 | 0f 05 54 21 open the region and 0f 06 04 01 00 00 closes it (LOOP_EXIT with byte 3 = 01). The table carries the
+# opener as one 14-byte instruction. Hardware-verified with divergent threads in one SIMD group and across threadgroups, and after a loop.
+# Only loop depth 0 is verified: an if nested in a loop probably needs the depth nibble in byte 0 (Apple hoisted our probe's if out of the loop).
+IF_BEGIN = Inst("if", bytes.fromhex("0a002b80 0600 07c20000 0f055421".replace(" ", "")), (Field("cond", B(1), 8),), doc="if cond != 0 { ... } endif; cond: (reg<<1)|1")
+IF_END = Inst("endif", bytes.fromhex("0f0604010000"), doc="closes IF_BEGIN")
 STORE = Inst("store", bytes.fromhex("e700540000002000"), (
   Field("first", B(1, 4), 1),       # set when no load preceded (probes/movimm.metal)
   Field("wait", B(2, 1), 1),        # wait for outstanding loads first (0x56). Required on the first consumer of load data, see LOAD_WAIT_MODEL
@@ -270,7 +276,7 @@ STORE_WAIT = Inst("store_wait", bytes.fromhex("110000901100"),
   doc="wait for the preceding store. Apple emits one after every store; two stores back to back lose data without it (test_agx)")
 BARRIER = STORE_WAIT # old name
 
-TABLE = (LOAD, FMAX, FMIN, I2F, U2F, F2I, F2U, SHL_IMM, LSHR_IMM, ASHR_IMM, SHL_REG, LSHR_REG, ASHR_REG, IADD, ISUB, INEG, IMUL_RR, IAND, IOR, IXOR, IMAX, IMIN, ISEL4, ISEL, ICMP, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
+TABLE = (LOAD, IF_BEGIN, IF_END, FMAX, FMIN, I2F, U2F, F2I, F2U, SHL_IMM, LSHR_IMM, ASHR_IMM, SHL_REG, LSHR_REG, ASHR_REG, IADD, ISUB, INEG, IMUL_RR, IAND, IOR, IXOR, IMAX, IMIN, ISEL4, ISEL, ICMP, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
 
 def movimm_bits_fields(v:int) -> dict[str, int]: return {n: (v >> lo) & ((1 << w) - 1) for n, lo, w in _MOVIMM_SLICES}
 def movimm_fields(f:float) -> dict[str, int]: return movimm_bits_fields(struct.unpack("<I", struct.pack("<f", f))[0])
@@ -301,6 +307,7 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
     c = f"#{'-' if d['c_hi'] else ''}{e4m3_value(d['c'] | 1):g}" if d["c_imm"] else f"{'-' if d['c_neg'] else ''}r{d['c'] >> 1}"
     return f"fma r{dst_reg(d)}, {'-' if d['negp'] else ''}{a}, r{operand_reg(d['srcb'])}, {c}" + "".join(f" ; {n}" for n in ("killa", "killb", "fwd") if d[n])
   if inst is MOVIMM: return f"movimm r{dst_reg(d)}, #{movimm_value(d):g}"
+  if inst is IF_BEGIN: return f"if r{operand_reg(d['cond'])}"
   if inst is GET_SR: return f"getsr r{d['dst']}, " + next((n for n, v in SR.items() if v == d["sr"]), f"#0x{d['sr']:02x}")
   if inst in CVTS.values(): return f"{inst.mnemonic} r{d['dst']}, r{d['a']}" + (" ; killa" if d["killa"] else "")
   if inst in SHIFTS.values(): return f"{inst.mnemonic} r{d['dst']}, r{d['a']}, " + (f"r{d['breg']}" if "breg" in d else f"#{d['n']}") + "".join(f" ; {n}" for n in ("killa", "killb") if d.get(n))

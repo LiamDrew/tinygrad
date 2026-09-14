@@ -218,6 +218,8 @@ class AGXRenderer(Renderer):
         ra, rb = val(u.src[0]), val(u.src[1])
         mn = {Ops.CMPLT: "fcmp.lt", Ops.CMPNE: "fcmp.ne", Ops.CMPEQ: "fcmp.eq", Ops.MAX: "fmax"}[u.op]
         d = alloc(u) if u.op is Ops.MAX else alloc_int(u); reg[u] = d; lines.append(f"{mn} r{d}, r{ra}, r{rb}")
+      elif u.op is Ops.IF: lines.append(f"if r{val(u.src[0])}")     # per-thread predication of the region up to ENDIF
+      elif u.op is Ops.ENDIF: lines.append("endif")
       elif u.op is Ops.SPECIAL:                                 # ("g"|"l", axis): threadgroup_position_in_grid / thread_position_in_threadgroup
         d = alloc_low(u); reg[u] = d; lines.append(f"getsr r{d}, {'gid' if u.arg[0] == 'g' else 'lid'}.{'xyz'[int(u.arg[-1])]}")
       elif u.op is Ops.CAST:                                    # int <-> float convert (a constant source is folded by tinygrad; else it is in a register)
