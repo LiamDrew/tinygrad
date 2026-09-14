@@ -79,6 +79,25 @@ changing value, so there is no timer or cycle counter to build an instruction-le
 delta of 1 in the scan but read 0 four times in a row directly, so that was an artifact of the surrounding instructions.
 Ablation - delete instructions from a real kernel and measure - is the profiler, and the table above is what it produces.
 
+## Tile shape (extra/agx/mm_tile.py)
+`mm_tile.py` parameterises the shape: MI A fragments by MJ B fragments per SIMD group, SG SIMD groups per threadgroup, so the
+threadgroup owns 8*MI by 8*MJ*SG of C. mm_direct is MI=4 MJ=4 SG=4. Alternated, min of 20:
+
+  | shape            | tile    | threadgroups at 1024 | N=1024  | N=2048  |
+  |------------------|---------|----------------------|---------|---------|
+  | MI=4 MJ=4 SG=4   | 32x128  | 256                  | 436 us  | 3156 us |
+  | MI=2 MJ=4 SG=2   | 16x64   | 1024                 | 416 us  | 3161 us |
+  | MI=4 MJ=4 SG=1   | 32x32   | 1024                 | 424 us  | -       |
+  | MI=2 MJ=2 SG=4   | 16x64   | 1024                 | 642 us  | -       |
+
+So the shape is worth ~5% at 1024 and nothing at 2048, and it is threadgroup count that matters, not the tile area: 2x4 and 2x2
+have the same tile but 2x2 halves the mmas per load and is 50% slower. MI=2 MJ=4 SG=2 closes the gap to MPS at 1024 (416 vs 415)
+while staying within 0.2% of the best at 2048, so it is the better default.
+**Below N=1024 this harness cannot measure.** At 512 the same kernel reads 63 us once and 250 us usually, because the GPU
+downclocks between short launches; MPS measured back-to-back reads 65 us. Our 63 is the same kernel in the same warm state, but
+it appears in roughly one run in fifty, so no ordering can be claimed there without keeping the GPU busy the way `REPS` does
+for MPS.
+
 ## The baseline that matters: Apple's MPS
 `extra/agx/mps_ref.py` runs `MPSMatrixMultiplication`, Apple's tuned library, through objc and times it with the command buffer's GPU
 timestamps. **Measure it with `REPS=20`**, which encodes 20 multiplications into one command buffer: with one per buffer a 1024 matmul
