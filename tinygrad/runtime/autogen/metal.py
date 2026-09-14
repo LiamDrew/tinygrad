@@ -1717,14 +1717,57 @@ MTLCommandEncoder._methods_ = [
   ('label', NSString, []),
   ('setLabel:', None, [NSString]),
 ]
+MTLResidencySetDescriptor._bases_ = [NSObject]
+MTLResidencySetDescriptor._methods_ = [
+  ('label', NSString, []),
+  ('setLabel:', None, [NSString]),
+  ('initialCapacity', NSUInteger, []),
+  ('setInitialCapacity:', None, [NSUInteger]),
+]
+MTLResidencySet._bases_ = [NSObject]
+MTLResidencySet._methods_ = [
+  ('requestResidency', None, []),
+  ('endResidency', None, []),
+  ('addAllocation:', None, [MTLAllocation]),
+  ('addAllocations:count:', None, [c.POINTER[MTLAllocation], NSUInteger]),
+  ('removeAllocation:', None, [MTLAllocation]),
+  ('removeAllocations:count:', None, [c.POINTER[MTLAllocation], NSUInteger]),
+  ('removeAllAllocations', None, []),
+  ('containsAllocation:', BOOL, [MTLAllocation]),
+  ('commit', None, []),
+  ('device', MTLDevice, []),
+  ('label', NSString, []),
+  ('allocatedSize', uint64_t, [], True),
+  ('allocationCount', NSUInteger, [], True),
+]
+MTLEvent._bases_ = [NSObject]
+MTLEvent._methods_ = [
+  ('device', MTLDevice, []),
+  ('label', NSString, []),
+  ('setLabel:', None, [NSString]),
+]
+class MTLSharedEventListener(objc.Spec): pass
+MTLSharedEventListener._bases_ = [NSObject]
+MTLSharedEventListener._methods_ = [
+  ('init', 'instancetype', []),
+]
+MTLSharedEventListener._classmethods_ = [
+  ('sharedListener', MTLSharedEventListener, []),
+]
+MTLSharedEventHandle._bases_ = [NSObject]
+MTLSharedEventHandle._methods_ = [
+  ('label', NSString, []),
+]
+MTLSharedEvent._bases_ = [MTLEvent]
+MTLSharedEvent._methods_ = [
+  ('newSharedEventHandle', MTLSharedEventHandle, [], True),
+  ('waitUntilSignaledValue:timeoutMS:', BOOL, [uint64_t, uint64_t]),
+  ('signaledValue', uint64_t, []),
+  ('setSignaledValue:', None, [uint64_t]),
+]
 MTLResourceCPUCacheModeShift = 0
 MTLResourceCPUCacheModeMask = (0xf << MTLResourceCPUCacheModeShift)
 MTLResourceStorageModeShift = 4
 MTLResourceStorageModeMask = (0xf << MTLResourceStorageModeShift)
 MTLResourceHazardTrackingModeShift = 8
 MTLResourceHazardTrackingModeMask = (0x3 << MTLResourceHazardTrackingModeShift)
-MTLSharedEvent._methods_ = [
-  ('signaledValue', uint64_t, []),
-  ('setSignaledValue:', None, [uint64_t]),
-  ('waitUntilSignaledValue:timeoutMS:', BOOL, [uint64_t, uint64_t]),
-]
