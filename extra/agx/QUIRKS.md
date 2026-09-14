@@ -137,8 +137,12 @@ Freezes and hangs are marked. Never emit an instruction whose fields you have no
 
 ## How much headroom is left in the matmul
 - `mm_direct` at N=2048 runs 3156 us. The identical kernel with every load and address instruction deleted runs 2936 us, and with the
-  accumulator chains collapsed to one, 2854 us. So the kernel is ~93% matrix-issue bound: perfect memory overlap is worth at most 7%, and
-  scoreboard slots and kill bits are bounded by that. The matrix unit sustains 16.78M mma instructions in 2936 us = 5.7e9 mma/s = 5.9 TFLOP/s.
+  accumulator chains collapsed to one, 2854 us. So perfect memory overlap is worth at most 7%, and scoreboard slots and kill bits are
+  bounded by that.
+- The wall is the **matrix unit**, not instruction issue. A pure-mma loop with 16, 32, 64 or 128 mmas sharing one set of loop-control
+  instructions runs 2917 / 2896 / 2896 / 2904 us: flat, even though loop control falls from 27% of the instruction stream to 4.5%. The unit
+  sustains 16.78M mma instructions in ~2900 us = 5.8e9 mma/s = 5.9 TFLOP/s of fp32, and nothing else in the kernel is competing for issue.
+  That number is the ceiling for any fp32 8x8x8 matmul on this chip, so the ~9% between it and mm_direct is all that tuning can ever reach.
 - Accumulator dependencies cost nothing: 16, 4 and 1 independent accumulator chains run 2935 / 2896 / 2854 us, i.e. fewer chains is marginally
   FASTER. In-place accumulation has no latency penalty, so there is nothing to win from more chains or from ping-ponging accumulators.
 
