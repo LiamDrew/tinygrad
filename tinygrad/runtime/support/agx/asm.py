@@ -9,18 +9,18 @@ def reg(tok):
     assert tok[0]=='r'; return int(tok[1:])
 def i_load(dstreg, slot, first, more_follow): return dsl.LOAD.encode(first=int(first), more=int(more_follow), dst=dstreg, slot=slot)
 def i_load_idx(dstreg, slot, areg, first, more_follow): return dsl.LOAD_IDX.encode(first=int(first), more=int(more_follow), dst=dstreg, slot=slot, areg=areg)
-def i_addr(dst, shift, imm=None, breg=None): # rD = (r1 << shift) + imm, or + rB
+def i_addr(dst, shift, imm=None, breg=None, a=1): # rD = (rA << shift) + imm, or + rB; A defaults to r1, the thread index
     assert 0 <= shift <= 4
     b = (breg << 2 | 1) if breg is not None else imm << 1
-    return dsl.ADDR.encode(dst=dst, b=b, breg=int(breg is not None), shift0=shift & 1, shift1=(shift >> 1) & 1, noshift=int(shift == 0))
+    return dsl.ADDR.encode(dst=dst, a=a, b=b, breg=int(breg is not None), shift0=shift & 1, shift1=(shift >> 1) & 1, noshift=int(shift == 0))
+def i_store_idx(srcreg, slot, areg, first=False, wait=False, last=False):
+    return dsl.STORE_IDX.encode(first=int(first), wait=int(wait), src=srcreg, slot=slot, areg=areg, last=int(last)) + dsl.STORE_WAIT.encode()
 def i_imul(dst, stride): return dsl.IMUL.encode(dst=dst, stride=stride)
 def i_wait(): return dsl.WAIT.encode()
-def loop_head(c, n): # returns bytes and the offset (within them) of the increment, the back-branch target
+def loop_head(c, n): # init and the increment/compare/enter block. between them the assembler puts the `pre` section (counter = 0..n-1)
     assert n >= 2, "loop counts below 2 hang the GPU"
-    head = dsl.LOOP_INIT.encode(dst=c)
-    inc_at = len(head)
-    head += dsl.LOOP_INC.encode(dst=c, step=1, src=c) + dsl.LOOP_CMP.encode(src=dsl.reg_operand(c), n=n >> 1) + dsl.NOP.encode() + dsl.LOOP_ENTER.encode(extra=n & 1)
-    return head, inc_at
+    inc = dsl.LOOP_INC.encode(dst=c, step=1, src=c) + dsl.LOOP_CMP.encode(src=dsl.reg_operand(c), n=n >> 1) + dsl.NOP.encode() + dsl.LOOP_ENTER.encode(extra=n & 1)
+    return dsl.LOOP_INIT.encode(dst=c), inc
 def loop_tail(back): # back: bytes from the increment to here
     return dsl.LOOP_TAIL.encode() + dsl.BRANCH.encode(off=(-(back + dsl.LOOP_TAIL.size)) & 0xffffffffff) + dsl.LOOP_EXIT.encode()
 def i_falu_imm(dst,a,imm,mul=0,wait=True): # an immediate needs the six-byte form (byte4 bit7); tail c0 only when waiting for loads
@@ -41,6 +41,7 @@ def i_fma(dst, a, b, c): # fma rD, rA|#imm, rB, rC|#imm|-rC : rD = rA*rB + rC  (
 def i_store(srcreg, slot, first=False, wait=False, last=False): # every store is followed by its wait, like Apple
     return dsl.STORE.encode(first=int(first), wait=int(wait), src=srcreg, slot=slot, last=int(last)) + dsl.STORE_WAIT.encode()
 def movimm_bytes(dst, f): return dsl.MOVIMM.encode(dst=dst, **dsl.movimm_fields(f))
+def movimm_bits(dst, v): return dsl.MOVIMM.encode(dst=dst, hi7=v >> 25, mid21=v & 0x1fffff, lo4=(v >> 21) & 0xf)
 
 PREAMBLE_IDX = bytes.fromhex('030007000200000060000e000000')  # thread-index preamble
 EPILOGUE     = dsl.STOP.encode() # the last store's wait precedes it
@@ -65,16 +66,19 @@ def assemble_text(program):
             if len(p)>3: main+=i_load_idx(d,slot,reg(p[3]), load_i==0, load_i<total_loads-1)
             else: main+=i_load(d,slot, load_i==0, load_i<total_loads-1)
             load_i+=1; seen_mem=True; pending=True
-        elif op=='addr':                                 # addr rD, shift, #imm | rB : rD = (t << shift) + imm | rB   (t is in r1)
-            if p[3].startswith('#'): main+=i_addr(reg(p[1]), int(p[2]), imm=int(p[3][1:]))
-            else: main+=i_addr(reg(p[1]), int(p[2]), breg=reg(p[3]))
+        elif op=='addr':                                 # addr rD, [rA,] shift, #imm | rB : rD = (rA << shift) + imm | rB  (rA defaults to r1 = t)
+            a = reg(p[2]) if len(p) > 4 else 1; sh, b = (int(p[3]), p[4]) if len(p) > 4 else (int(p[2]), p[3])
+            if b.startswith('#'): main+=i_addr(reg(p[1]), sh, imm=int(b[1:]), a=a)
+            else: main+=i_addr(reg(p[1]), sh, breg=reg(b), a=a)
         elif op=='imul':                                 # imul rD, #stride : rD = t * stride
             main+=i_imul(reg(p[1]), int(p[2].lstrip('#')))
-        elif op=='loop':                                 # loop rC, #n ... endloop : body runs n times with rC = 1..n
-            head, inc_at = loop_head(reg(p[1]), int(p[2].lstrip('#')))
-            loops.append(len(main) + inc_at); main+=head; pending=False   # loop_init's tail waits for loads
+        elif op=='loop':                                 # loop rC, #n [pre] body [post] endloop
+            init, inc = loop_head(reg(p[1]), int(p[2].lstrip('#')))  # pre: ALU-only, sees rC = 0..n-1 (Apple's layout); post: the rest, rC = 1..n
+            main+=init; loops.append((len(main), inc)); pending=False # loop_init's tail waits for pending loads
+        elif op=='body':
+            main+=loops[-1][1]
         elif op=='endloop':
-            main+=loop_tail(len(main) - loops.pop())
+            start, _ = loops.pop(); main+=loop_tail(len(main) - start)
         elif op=='wait':
             main+=i_wait()
         elif op in ('fadd','fmul'):
@@ -86,11 +90,14 @@ def assemble_text(program):
             pending=False
         elif op=='fma':                                  # fma rD, rA, rB, rC
             main+=i_fma(reg(p[1]), p[2], reg(p[3]), p[4]); pending=False
-        elif op=='movimm':
-            d=reg(p[1]); main+=movimm_bytes(d,float(p[2].lstrip('#')))
-        elif op=='store':
+        elif op=='movimm':                               # movimm rD, #1.5  |  movimm rD, #0xdeadbeef (raw bits)
+            d=reg(p[1]); v=p[2].lstrip('#')
+            main+=movimm_bits(d,int(v,16)) if v.startswith('0x') else movimm_bytes(d,float(v))
+        elif op=='store':                                # store rS, slot  |  store rS, slot, rA (element offset in rA)
             s=reg(p[1]); slot=int(p[2]); N=max(N,slot+1); written.add(slot)
-            main+=i_store(s,slot, first=not seen_mem, wait=pending, last=bi==last_store); seen_mem=True; pending=False
+            if len(p)>3: main+=i_store_idx(s,slot,reg(p[3]), first=not seen_mem, wait=pending, last=bi==last_store)
+            else: main+=i_store(s,slot, first=not seen_mem, wait=pending, last=bi==last_store)
+            seen_mem=True; pending=False
         else:
             raise ValueError(f"unknown op {op}")
     main+=EPILOGUE

@@ -79,14 +79,15 @@ LOAD_IDX = Inst("load", bytes.fromhex("6700440000802000"), (
 # element offset arithmetic on the thread index, which the prologue leaves in r1 (byte 4 = 02 names it; keep r1 reserved).
 # shift-add: dst = (r1 << shift) + (imm | rB). shift bits: byte7 bit6 = bit0, byte9 bit4 = bit1, both zero means 4; byte8 bit0 = no shift.
 # byte9 bit0: byte5 is a register (unit: field<<1 | 1 for 32-bit) instead of imm<<1. All hardware-verified (test_agx); byte7 bit5 does nothing.
-ADDR = Inst("addr", bytes.fromhex("9f115400020008881004"), (
+ADDR = Inst("addr", bytes.fromhex("9f115400020000881004"), (
   Field("dst", B(3, 1), 7),
   Field("b", B(5), 8),              # imm<<1, or (reg<<2 | 1) when breg is set
+  Field("a", B(6, 3), 5),           # register A (hardware-verified with r1 = thread index and r4 = a loaded value)
   Field("shift0", B(7, 6), 1),
   Field("noshift", B(8, 0), 1),
   Field("breg", B(9, 0), 1),
   Field("shift1", B(9, 4), 1)),
-  doc="dst = (r1 << shift) + b, an element offset for LOAD_IDX")
+  doc="dst = (a << shift) + b: integer shift-add. A loaded operand must have been waited on (a waiting consumer before this op)")
 # multiply: dst = r1 * stride. 12-byte form, stride in bits [15:2] (probes: 7t -> 1c 00, 100t -> 90 01); the low two bits are ignored.
 IMUL = Inst("imul", bytes.fromhex("9f1054000204000050200200"), (
   Field("dst", B(3, 1), 7),
@@ -106,6 +107,9 @@ LOOP_ENTER = Inst("loop_enter", bytes.fromhex("07020000"), (Field("extra", B(0, 
 LOOP_TAIL = Inst("loop_tail", bytes.fromhex("8f045422"), doc="loop control before the back branch, constant in every probe")
 BRANCH = Inst("branch", bytes.fromhex("0f00540000000000ff00"), (Field("off", B(3), 40),), doc="pc += off (relative to this instruction's address); 10 bytes")
 LOOP_EXIT = Inst("loop_exit", bytes.fromhex("0f0604020000"), doc="after the loop; stores do not land without it")
+STORE_IDX = Inst("store", bytes.fromhex("e700540000802000"), (
+  Field("first", B(1, 4), 1), Field("wait", B(2, 1), 1), Field("src", B(3, 1), 7), Field("slot", B(4), 8), Field("areg", B(5, 0), 7), Field("last", B(6, 0), 1)),
+  doc="buf[slot][areg] = src (32-bit): store through an element offset register, like LOAD_IDX")
 STORE = Inst("store", bytes.fromhex("e700540000012000"), (
   Field("first", B(1, 4), 1),       # set when no load preceded (probes/movimm.metal)
   Field("wait", B(2, 1), 1),        # wait for outstanding loads first (0x56). Required on the first consumer of load data, see LOAD_WAIT_MODEL
@@ -146,11 +150,11 @@ FMA = Inst("fma", bytes.fromhex("090006000100 02c0"), (
   Field("negp", B(7, 3), 1), Field("aimm", B(7, 1), 1)),
   doc="dst = srca * srcb + c")
 MOVIMM = Inst("movimm", bytes.fromhex("0c80020000000000"), (
+  Field("dst", B(0, 4), 4),         # destination register, top nibble of byte 0 like the float ALU (probe: two constants -> 2c.., 0c..)
   Field("hi7", B(3, 1), 7),         # fp32 bits[31:25]
   Field("mid21", B(4, 3), 21),      # fp32 bits[20:0]
-  Field("lo4", B(7, 0), 4),         # fp32 bits[24:21]
-  Field("dst", B(7, 4), 4)),        # destination register (probes/movimm.metal: r0 -> 0; unit unverified beyond r0)
-  doc="dst = fp32 immediate")
+  Field("lo4", B(7, 0), 4)),        # fp32 bits[24:21]; byte 7's upper nibble is not the destination (an earlier guess that cost a day)
+  doc="dst = 32-bit immediate (any bit pattern; used for floats and for a loop counter's -1 start)")
 NOP = Inst("nop", bytes.fromhex("0600"))
 STOP = Inst("stop", bytes.fromhex("0e000000"))
 GET_TID = Inst("get_tid", bytes.fromhex("1ca01006"), doc="read thread_position_in_grid (prologue)")
@@ -158,7 +162,7 @@ STORE_WAIT = Inst("store_wait", bytes.fromhex("110000901100"),
   doc="wait for the preceding store. Apple emits one after every store; two stores back to back lose data without it (test_agx)")
 BARRIER = STORE_WAIT # old name
 
-TABLE = (LOAD_IDX, LOAD, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
+TABLE = (LOAD_IDX, LOAD, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE_IDX, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
 
 def movimm_fields(f:float) -> dict[str, int]:
   v = struct.unpack("<I", struct.pack("<f", f))[0]
@@ -172,7 +176,8 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
   if inst is LOAD_IDX: return f"load r{d['dst']}, {d['slot']}, r{d['areg']}" + (" ; first" if d["first"] else "") + (" ; more" if d["more"] else "")
   if inst is ADDR:
     sh = 0 if d["noshift"] else (d["shift0"] | d["shift1"] << 1) or 4
-    return f"addr r{d['dst']}, {sh}, " + (f"r{d['b'] >> 2}" if d["breg"] else f"#{d['b'] >> 1}")
+    return f"addr r{d['dst']}, r{d['a']}, {sh}, " + (f"r{d['b'] >> 2}" if d["breg"] else f"#{d['b'] >> 1}")
+  if inst is STORE_IDX: return f"store r{d['src']}, {d['slot']}, r{d['areg']}" + "".join(f" ; {n}" for n in ("first", "wait", "last") if d[n])
   if inst is IMUL: return f"imul r{d['dst']}, #{d['stride']}"
   if inst is LOOP_INIT: return f"loop_init r{d['dst']}"
   if inst is LOOP_INC: return f"loop_inc r{d['dst']}, r{d['src']}, #{d['step']}"

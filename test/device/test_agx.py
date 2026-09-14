@@ -94,12 +94,19 @@ class TestAGX(unittest.TestCase):
     a = [float(i) for i in range(8)]
     for c, n in ((3, 4), (6, 4), (3, 3), (3, 5), (3, 16)):
       with self.subTest(counter=c, n=n):
-        self.assertEqual(self.run_asm8(f".buffers 3\nload r2, 1\nwait\nloop r{c}, #{n}\nfadd r2, r2, #1.0\nendloop\nstore r2, 0\n", a, a), [x + n for x in a])
+        self.assertEqual(self.run_asm8(f".buffers 3\nload r2, 1\nwait\nloop r{c}, #{n}\nbody\nfadd r2, r2, #1.0\nendloop\nstore r2, 0\n", a, a), [x + n for x in a])
 
-  def test_reduce(self): # the first reduction: out[t] = sum of a[8t+1 .. 8t+8] (the counter is 1..8 inside the body)
-    a = [float(i * i % 17) for i in range(72)]
-    src = ".buffers 3\nloop r3, #8\naddr r6, 3, r3\nload r8, 1, r6\nwait\nfadd r2, r2, r8\nendloop\nstore r2, 0\n"
-    self.assertEqual(self.run_asm8(src, a, a), [sum(a[8 * t + 1:8 * t + 9]) for t in range(8)])
+  def test_reduce(self): # the first reduction: out[t] = sum of a[8t .. 8t+7]. the address math sits in the pre section (counter 0..n-1)
+    a = [float(i * i % 17) for i in range(64)]
+    src = ".buffers 3\nloop r3, #8\naddr r6, 3, r3\nbody\nload r8, 1, r6\nwait\nfadd r2, r2, r8\nendloop\nstore r2, 0\n"
+    self.assertEqual(self.run_asm8(src, a, a), [sum(a[8 * t:8 * t + 8]) for t in range(8)])
+
+  def test_addr_any_register(self): # rD = (rA << s) + b with rA a counter, and a store through a computed address
+    a = [float(i) for i in range(64)]
+    # out[t] = a[2*(t+3)]: r4 = t + 3 (addr on r1), r6 = (r4 << 1) + 0
+    self.assertEqual(self.run_asm8(".buffers 3\naddr r4, 0, #3\naddr r6, r4, 1, #0\nload r0, 1, r6\nwait\nstore r0, 0\n", a, a), a[6:22:2])
+    # indexed store: out[t+1] = a[t] for t < 7, out[0] untouched (0)
+    self.assertEqual(self.run_asm8(".buffers 3\nload r0, 1\nwait\naddr r4, 0, #1\nstore r0, 0, r4\n", a, a)[1:], a[0:7])
 
   def test_addr_register(self): # the offset can live in another register (probe with r0 busy: 9f ... 04 / load byte5 82)
     a = [float(i) for i in range(16)]
