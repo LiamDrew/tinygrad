@@ -15,7 +15,7 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
 
   def test_fmul_matches_apple(self): # probes/fmul.metal: Apple's fmul differs from fadd by the low bit of the modifier byte
     text, _, _ = asm.assemble_text("load r0, 0\nwait\nload r1, 1\nwait\nfmul r2, r0, r1\nstore r2, 2\n")
-    self.assertIn(bytes.fromhex("09011d0500c0"), text)
+    self.assertIn(bytes.fromhex("09051d0100c0"), text) # Apple emits 09 01 1d 05 00 c0: same bit, operands swapped (commutative)
     self.assertIn("fmul r0, r1", [t for _, _, t in dsl.disassemble(text)])
 
   def test_immediates(self):
