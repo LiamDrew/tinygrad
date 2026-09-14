@@ -77,19 +77,17 @@ REGISTER_FILE = """128 32-bit registers, r0..r127 (hardware-verified 2026-09-14,
 
 # ---- the table --------------------------------------------------------------------------------------------------------------------
 
-LOAD = Inst("load", bytes.fromhex("6700440000012000"), (
+# loads and stores index a buffer slot by a 32-bit element offset register. The "plain" form Apple emits for buf[t] is areg = r1, the thread
+# index the prologue leaves there. byte5 bit7 is areg's kill bit (KILL_MODEL), which an earlier reading mistook for an addressing-mode bit.
+LOAD = Inst("load", bytes.fromhex("6700440000002000"), (
   Field("first", B(1, 4), 1),       # set on the first load of the kernel
   Field("more", B(2, 4), 1),        # another load follows (scoreboard)
-  Field("dst", B(3, 1), 7),         # destination register (reg_field)
-  Field("slot", B(4), 8)),          # dense buffer binding index
-  doc="dst = buf[slot][thread_index] (32-bit)")
-LOAD_IDX = Inst("load", bytes.fromhex("6700440000802000"), (
-  Field("first", B(1, 4), 1),
-  Field("more", B(2, 4), 1),
-  Field("dst", B(3, 1), 7),
-  Field("slot", B(4), 8),
-  Field("areg", B(5, 0), 7)),       # element offset register (32-bit); byte5 bit7 selects this mode (probes/off1.metal, r0 busy -> 82)
-  doc="dst = buf[slot][areg] (32-bit): base of slot plus an element offset from a register, no thread index")
+  Field("dst", B(3, 1), 7),         # destination register
+  Field("slot", B(4), 8),           # dense buffer binding index
+  Field("areg", B(5, 0), 7),        # element offset register (32-bit)
+  Field("killa", B(5, 7), 1)),      # areg dies after this load
+  doc="dst = buf[slot][areg] (32-bit)")
+LOAD_IDX = LOAD # old name
 # element offset arithmetic on the thread index, which the prologue leaves in r1 (byte 4 = 02 names it; keep r1 reserved).
 # shift-add: dst = (r1 << shift) + (imm | rB). shift bits: byte7 bit6 = bit0, byte9 bit4 = bit1, both zero means 4; byte8 bit0 = no shift.
 # byte9 bit0: byte5 is a register (unit: field<<1 | 1 for 32-bit) instead of imm<<1. All hardware-verified (test_agx); byte7 bit5 does nothing.
@@ -121,16 +119,16 @@ LOOP_ENTER = Inst("loop_enter", bytes.fromhex("07020000"), (Field("extra", B(0, 
 LOOP_TAIL = Inst("loop_tail", bytes.fromhex("8f045422"), (Field("depth4", B(3, 2), 6),), doc="loop control before the back branch; byte3 = 0x22 + 4 * nesting depth")
 BRANCH = Inst("branch", bytes.fromhex("0f00540000000000ff00"), (Field("off", B(3), 40),), doc="pc += off (relative to this instruction's address); 10 bytes")
 LOOP_EXIT = Inst("loop_exit", bytes.fromhex("0f0604020000"), doc="after the loop; stores do not land without it")
-STORE_IDX = Inst("store", bytes.fromhex("e700540000802000"), (
-  Field("first", B(1, 4), 1), Field("wait", B(2, 1), 1), Field("src", B(3, 1), 7), Field("slot", B(4), 8), Field("areg", B(5, 0), 7), Field("last", B(6, 0), 1)),
-  doc="buf[slot][areg] = src (32-bit): store through an element offset register, like LOAD_IDX")
-STORE = Inst("store", bytes.fromhex("e700540000012000"), (
+STORE = Inst("store", bytes.fromhex("e700540000002000"), (
   Field("first", B(1, 4), 1),       # set when no load preceded (probes/movimm.metal)
   Field("wait", B(2, 1), 1),        # wait for outstanding loads first (0x56). Required on the first consumer of load data, see LOAD_WAIT_MODEL
   Field("src", B(3, 1), 7),         # source register
   Field("slot", B(4), 8),
+  Field("areg", B(5, 0), 7),        # element offset register (32-bit); r1 = thread index for buf[t]
+  Field("killa", B(5, 7), 1),       # areg dies after this store
   Field("last", B(6, 0), 1)),       # Apple sets it on a kernel's final store only; no observable effect on hardware (probes/two_stores.metal)
-  doc="buf[slot][thread_index] = src (32-bit). Must be followed by STORE_WAIT before the next store")
+  doc="buf[slot][areg] = src (32-bit). Must be followed by STORE_WAIT before the next store")
+STORE_IDX = STORE # old name
 WAIT = Inst("wait", bytes.fromhex("510100404600"), doc="wait for one outstanding load")
 LOAD_WAIT_MODEL = """Loads are asynchronous and the synchronization is explicit, in the consumer (hardware-verified, test_agx):
   1. every load is followed by WAIT (51 01 00 40 46 00); it must directly follow its load.
@@ -138,6 +136,10 @@ LOAD_WAIT_MODEL = """Loads are asynchronous and the synchronization is explicit,
      Non-waiting consumers (four-byte FALU, STORE 0x54) read stale registers (zeros) if they come first.
   3. one waiting consumer covers all outstanding loads: after it, four-byte FALU and 0x54 stores are fine (Apple emits exactly this).
 Apple's later six-byte ops carry tails 00 20 / 00 40; those do not work as the first consumer and are not understood."""
+KILL_MODEL = """Operand kill bits are real semantics, not hints (hardware-verified 2026-09-14): after an op with a source's kill bit set, that
+register reads as 0. Apple's compiler sets them on the last use of every value (register release). Ours: the assembler sets none by default; a
+value read twice (fadd r4, r0, r2 / fadd r6, r0, r2) came back 0 while every kill bit was set. Kill bits found so far: FALU/FMA killa, killb;
+FMA c_hi (its register c); LOAD/STORE byte5 bit7 (areg). The old renderer only survived because every register was read exactly once."""
 # float ALU. 4-byte form: [09 | dst<<4] [srcb] [mod] [srca]. mod bit2 adds the two-byte tail (FALU_LONG); mod bit1 adds an fma third operand.
 # destination registers: the 4-bit nibble in byte 0 holds bits [3:0]; bits [5:4] sit in the mod byte's top two bits (probes/live24, live48:
 # fadd r21 = 59 b1 54, r40 = 89 b1 94; Apple never writes above r63 with these forms, even with 96 values live). Same split for MOVIMM.
@@ -147,7 +149,7 @@ FALU = Inst("falu", bytes.fromhex("09000000"), (
   DST_HI,
   Field("srcb", B(1), 8),           # register operand, or E4M3 immediate when bmode has bit 7
   Field("mul", B(2, 0), 1),         # 0 = fadd, 1 = fmul (probes/fmul.metal); mod bit1 (fixed 0 here) selects FMA
-  Field("killb", B(2, 3), 1),       # srcb dies after this op (compiler hint; every probe agrees, semantics unverified)
+  Field("killb", B(2, 3), 1),       # srcb dies after this op: it reads as 0 afterwards (KILL_MODEL)
   Field("killa", B(2, 4), 1),       # srca dies after this op
   Field("fwd", B(2, 5), 1),         # result feeds another ALU op rather than a store
   Field("srca", B(3), 8)),
@@ -156,14 +158,15 @@ FALU_LONG = Inst("falu", bytes.fromhex("090004000000"), tuple(FALU.fields) + (Fi
   doc="six-byte float ALU: byte4 = 0, or 0x80 for an immediate srcb; tail byte 0xc0 = wait for outstanding loads (LOAD_WAIT_MODEL)")
 FALU_IMM_NEG, FALU_IMM_ADD = 1, 0    # for an E4M3 immediate srcb the sign lives in killb: 0x14 = add, 0x1c = negate (prog_add vs probes)
 # fused multiply-add, 8 bytes: dst = (+-)(srca * srcb) + (+-)c. Hardware-verified (test_agx) for register/immediate c, negated c,
-# negated product, immediate srca, and dst != r0. byte4: bit5 = c is an E4M3 immediate, bit4 = negate register c, bit7 = set for a
-# register c or a negated immediate c (probes/mul_add.metal and friends). byte7: bit3 = negate the product, bit1 = srca is an immediate.
+# negated product, immediate srca, and dst != r0. byte4: bit5 = c is an E4M3 immediate, bit4 = negate register c, bit7 = kill register c
+# (Apple sets it on a last use, and on a negated immediate c; probes/mul_add.metal and friends). byte7: bit3 = negate the product, bit1 = srca is an immediate.
 FMA = Inst("fma", bytes.fromhex("090006000100 02c0"), (
   Field("dst", B(0, 4), 4), DST_HI,
   Field("srcb", B(1), 8),
   Field("killb", B(2, 3), 1), Field("killa", B(2, 4), 1), Field("fwd", B(2, 5), 1),
   Field("srca", B(3), 8),
-  Field("c_hi", B(4, 7), 1), Field("c_imm", B(4, 5), 1), Field("c_neg", B(4, 4), 1),
+  Field("c_hi", B(4, 7), 1),        # register c: its kill bit (KILL_MODEL; hardware-verified: c survives with 0). Apple also sets it on a negated immediate c
+  Field("c_imm", B(4, 5), 1), Field("c_neg", B(4, 4), 1),
   Field("c", B(5), 8),              # register << 1, or E4M3 immediate without its low bit
   Field("negp", B(7, 3), 1), Field("aimm", B(7, 1), 1)),
   doc="dst = srca * srcb + c")
@@ -188,7 +191,7 @@ STORE_WAIT = Inst("store_wait", bytes.fromhex("110000901100"),
   doc="wait for the preceding store. Apple emits one after every store; two stores back to back lose data without it (test_agx)")
 BARRIER = STORE_WAIT # old name
 
-TABLE = (LOAD_IDX, LOAD, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE_IDX, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
+TABLE = (LOAD, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
 
 def movimm_bits_fields(v:int) -> dict[str, int]: return {n: (v >> lo) & ((1 << w) - 1) for n, lo, w in _MOVIMM_SLICES}
 def movimm_fields(f:float) -> dict[str, int]: return movimm_bits_fields(struct.unpack("<I", struct.pack("<f", f))[0])
@@ -197,12 +200,10 @@ def movimm_value(d:dict[str, int]) -> float: return struct.unpack("<f", struct.p
 
 # ---- disassembler -----------------------------------------------------------------------------------------------------------------
 def fmt(inst:Inst, d:dict[str, int]) -> str:
-  if inst is LOAD: return f"load r{d['dst']}, {d['slot']}" + (" ; first" if d["first"] else "") + (" ; more" if d["more"] else "")
-  if inst is LOAD_IDX: return f"load r{d['dst']}, {d['slot']}, r{d['areg']}" + (" ; first" if d["first"] else "") + (" ; more" if d["more"] else "")
+  if inst is LOAD: return f"load r{d['dst']}, {d['slot']}, r{d['areg']}" + "".join(f" ; {n}" for n in ("first", "more", "killa") if d[n])
   if inst is ADDR:
     sh = 0 if d["noshift"] else (d["shift0"] | d["shift1"] << 1) or 4
     return f"addr r{d['dst']}, r{d['a']}, {sh}, " + (f"r{d['b'] >> 2}" if d["breg"] else f"#{d['b'] >> 1}")
-  if inst is STORE_IDX: return f"store r{d['src']}, {d['slot']}, r{d['areg']}" + "".join(f" ; {n}" for n in ("first", "wait", "last") if d[n])
   if inst is IMUL: return f"imul r{d['dst']}, #{d['stride']}"
   if inst is LOOP_INIT: return f"loop_init r{d['dst']}"
   if inst is LOOP_INC: return f"loop_inc r{d['dst']}, r{d['src']}, #{d['step']}"
@@ -210,7 +211,7 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
   if inst is LOOP_TAIL: return "loop_tail" + (f" ; depth {d['depth4'] - 8}" if d["depth4"] != 8 else "")
   if inst is LOOP_ENTER: return "loop_enter" + (" ; extra" if d["extra"] else "")
   if inst is BRANCH: return f"branch {d['off'] - (1 << 40) if d['off'] >> 39 else d['off']:+d}"
-  if inst is STORE: return f"store r{d['src']}, {d['slot']}" + "".join(f" ; {n}" for n in ("first", "wait", "last") if d[n])
+  if inst is STORE: return f"store r{d['src']}, {d['slot']}, r{d['areg']}" + "".join(f" ; {n}" for n in ("first", "wait", "killa", "last") if d[n])
   if inst is FALU or inst is FALU_LONG:
     op, dst, a = "fmul" if d["mul"] else "fadd", f"r{dst_reg(d)}", f"r{operand_reg(d['srca'])}"
     flags = "".join(f" ; {n}" for n in ("killa", "killb", "fwd") if d[n]) + (f" ; tag {d['tag']:02x}" if inst is FALU_LONG and d["tag"] != 0xc0 else "")

@@ -10,8 +10,8 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
     text, n, written = asm.assemble_text(src)
     self.assertEqual((n, written), (3, {0}))
     body = [t for _, _, t in dsl.disassemble(text)]
-    self.assertEqual(body, [".preamble 64 bytes", "get_tid", "load r0, 1 ; first ; more", "wait", "load r2, 2", "wait", "fadd r4, r0, r2 ; killa ; killb",
-                            "store r4, 0 ; last", "store_wait", "stop"])
+    self.assertEqual(body, [".preamble 64 bytes", "get_tid", "load r0, 1, r1 ; first ; more", "wait", "load r2, 2, r1", "wait", "fadd r4, r0, r2",
+                            "store r4, 0, r1 ; last", "store_wait", "stop"])
     self.assertFalse(any(t.startswith(".short") for t in body), "every emitted byte decodes")
 
   def test_apple_bytes_decode(self): # bytes captured from probes/*.metal
@@ -20,7 +20,8 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
                        ("c9110015", "fadd r12, r10, r8"),                                        # sums_live: 4-byte form, explicit dst
                        ("3905040100c0", "fadd r3, r0, r2"),                                      # keep_inputs: odd dst
                        ("09c9140180c0", "fadd r0, r0, #3 ; killa"),                              # add_const: E4M3 immediate
-                       ("6700440400012000", "load r2, 0"), ("e700540800012100", "store r4, 0 ; last"), ("e700560000012000", "store r0, 0 ; wait")]:
+                       ("6700440400012000", "load r2, 0, r1"), ("e700540800012100", "store r4, 0, r1 ; last"), ("e700560000012000", "store r0, 0, r1 ; wait"),
+                       ("6700440000822000", "load r0, 0, r2 ; killa")]:   # probes/off1.metal: byte5 82 = areg r2 with its kill bit
       b = bytes.fromhex(hexs)
       inst = next(i for i in dsl.TABLE if i.matches(b))
       self.assertEqual(dsl.fmt(inst, inst.decode(b)), want, hexs)
@@ -36,7 +37,7 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
     text, _, _ = asm.assemble_text("movimm r0, #42.0\nfadd r0, r0, #-3.5\nstore r0, 0\n")
     body = [t for _, _, t in dsl.disassemble(text)]
     self.assertIn("movimm r0, #42", body)
-    self.assertIn("fadd r0, r0, #-3.5 ; killa ; killb ; tag 00", body) # no loads pending: not a waiting op
+    self.assertIn("fadd r0, r0, #-3.5 ; killb ; tag 00", body) # no loads pending: not a waiting op. killb carries the immediate's sign
 
 @unittest.skipUnless(Device.DEFAULT == "AGX", "AGX device required")
 class TestAGX(unittest.TestCase):
@@ -77,6 +78,57 @@ class TestAGX(unittest.TestCase):
          patch.object(ops_metal.MetalQueue, "dims", staticmethod(lambda prg: (8, 1, 1, 1, 1, 1))):
       x, y = Tensor(a).contiguous().realize(), Tensor(b).contiguous().realize()
       return (x[:8] + y[:8]).contiguous().tolist() if False else (x + y).tolist()[:8]
+
+  def run_asm_list(self, src:str, a:list[float], b:list[float]) -> list[float]: # tinygrad's own dispatch (one thread), whole output
+    from tinygrad.runtime import ops_agx
+    from tinygrad import codegen
+    from tinygrad.runtime.support import hcq2
+    from tinygrad.engine import realize
+    for c in (codegen.to_program_cache, hcq2.hcq_compile_cache, hcq2.link_linear_cache, realize.runtime_cache): c.clear()
+    Device[Device.DEFAULT].wait_timeout_ms = 10000.0
+    with patch.object(ops_agx.AGXRenderer, "render", lambda self, uops: src):
+      x, y = Tensor(a).contiguous().realize(), Tensor(b).contiguous().realize()
+      return (x + y).tolist()
+
+  def test_kill_model(self): # dsl.KILL_MODEL: with no kill bits set, a register can be read again after an op, a load and a store
+    self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nfadd r4, r0, r2\nfadd r6, r0, r2\nstore r6, 0\n", 1.5, 2.25), 3.75)
+    self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nmovimm r5, #3.0\nfma r4, r0, r2, r5\nfadd r6, r5, r4\nstore r6, 0\n", 1.5, 2.25), 9.375)
+    # one address register shared by the load and the store of every iteration (the elementwise kernel shape); with the load's kill bit set only element 0 landed
+    a = [float(i) for i in range(8)]
+    src = ".buffers 3\nloop r2, #8\naddr r3, r2, 0, #0\nbody\nload r4, 1, r3\nwait\nload r5, 2, r3\nwait\nfmul r6, r4, r5\nstore r6, 0, r3\nendloop\n"
+    self.assertEqual(self.run_asm_list(src, a, a), [x * x for x in a])
+    # a killed register reads as 0 (the fact the model rests on)
+    from tinygrad.runtime.support.agx import asm
+    from tinygrad.renderer.agx import dsl
+    killing = lambda dst, a, bb, mul=0, wait=True: dsl.FALU_LONG.encode(**dsl.dst_fields(dst), srcb=dsl.reg_operand(bb), mul=mul, killa=1, killb=1, srca=dsl.reg_operand(a), tag=0xc0)
+    with patch.object(asm, "i_falu_reg", killing):
+      self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nfadd r4, r0, r2\nfadd r6, r0, r2\nstore r6, 0\n", 1.5, 2.25), 0.0)
+
+  def run_capturing(self, t:Tensor) -> tuple[list, list[str]]: # t.tolist() and the renderer's output for every kernel it ran
+    from tinygrad.runtime import ops_agx
+    from tinygrad import codegen
+    codegen.to_program_cache.clear()
+    srcs, orig = [], ops_agx.AGXRenderer.render
+    with patch.object(ops_agx.AGXRenderer, "render", lambda self, uops: (srcs.append(orig(self, uops)), srcs[-1])[1]): got = t.tolist()
+    return got, srcs
+
+  def test_register_reuse(self): # the allocator gives registers back at a value's last read; sequential allocation needed 80+ here
+    import re
+    from tinygrad.helpers import Context
+    A = [float(i) / 8 for i in range(8)]; B = [float(i % 3) - 1 for i in range(8)]
+    a, b = Tensor(A).contiguous().realize(), Tensor(B).contiguous().realize()
+    x, want = a, A[:]
+    for _ in range(40): x = x * b + a; want = [w * bb + aa for w, bb, aa in zip(want, B, A)]
+    with Context(NOOPT=1): got, srcs = self.run_capturing(x)
+    self.assertEqual(got, want)
+    self.assertLess(max(int(r) for r in re.findall(r"\br(\d+)", srcs[-1])), 10, srcs[-1])
+
+  def test_many_live_values(self): # 24 loads live at once, then a chain of fmas: registers into the twenties, all correct
+    from tinygrad.helpers import Context
+    with Context(NOOPT=1):
+      ins = [Tensor([float(i + j) for j in range(8)]).contiguous().realize() for i in range(24)]
+      y = sum(ins[2 * i] * ins[2 * i + 1] for i in range(12))
+      self.assertEqual(y.tolist(), [sum((2 * i + j) * (2 * i + 1 + j) for i in range(12)) for j in range(8)])
 
   def test_addr_offset(self): # addr r0 = t + imm; indexed load through r0 (dsl.ADDR, dsl.LOAD_IDX)
     a = [float(i) for i in range(16)]

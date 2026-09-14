@@ -8,14 +8,15 @@ from tinygrad.renderer.agx import dsl
 MAXREG=[0] # highest register named while assembling, declared to the driver in the metadata
 def reg(tok):
     assert tok[0]=='r'; MAXREG[0]=max(MAXREG[0], int(tok[1:])); return int(tok[1:])
-def i_load(dstreg, slot, first, more_follow): return dsl.LOAD.encode(first=int(first), more=int(more_follow), dst=dstreg, slot=slot)
-def i_load_idx(dstreg, slot, areg, first, more_follow): return dsl.LOAD_IDX.encode(first=int(first), more=int(more_follow), dst=dstreg, slot=slot, areg=areg)
+def i_load_idx(dstreg, slot, areg, first, more_follow, kill=False): # kill: areg dies here (dsl.KILL_MODEL)
+    return dsl.LOAD.encode(first=int(first), more=int(more_follow), dst=dstreg, slot=slot, areg=areg, killa=int(kill))
+def i_load(dstreg, slot, first, more_follow): return i_load_idx(dstreg, slot, 1, first, more_follow) # buf[t]: the thread index is in r1
 def i_addr(dst, shift, imm=None, breg=None, a=1): # rD = (rA << shift) + imm, or + rB; A defaults to r1, the thread index
     assert 0 <= shift <= 4
     b = (breg << 2 | 1) if breg is not None else imm << 1
     return dsl.ADDR.encode(dst=dst, a=a, b=b, breg=int(breg is not None), shift0=shift & 1, shift1=(shift >> 1) & 1, noshift=int(shift == 0))
-def i_store_idx(srcreg, slot, areg, first=False, wait=False, last=False):
-    return dsl.STORE_IDX.encode(first=int(first), wait=int(wait), src=srcreg, slot=slot, areg=areg, last=int(last)) + dsl.STORE_WAIT.encode()
+def i_store_idx(srcreg, slot, areg, first=False, wait=False, last=False, kill=False): # every store is followed by its wait, like Apple
+    return dsl.STORE.encode(first=int(first), wait=int(wait), src=srcreg, slot=slot, areg=areg, killa=int(kill), last=int(last)) + dsl.STORE_WAIT.encode()
 def i_imul(dst, stride): return dsl.IMUL.encode(dst=dst, stride=stride)
 def i_wait(): return dsl.WAIT.encode()
 def loop_head(c, n, depth): # init and the increment/compare/enter block. between them the assembler puts the `pre` section (counter = 0..n-1)
@@ -26,21 +27,20 @@ def loop_tail(back, depth): # back: bytes from the increment to here
     return dsl.LOOP_TAIL.encode(depth4=8 + depth) + dsl.BRANCH.encode(off=(-(back + dsl.LOOP_TAIL.size)) & 0xffffffffff) + dsl.LOOP_EXIT.encode()
 def i_falu_imm(dst,a,imm,mul=0,wait=True): # an immediate needs the six-byte form (byte4 bit7); tail c0 only when waiting for loads
     b,neg=dsl.e4m3(imm)
-    return dsl.FALU_LONG.encode(**dsl.dst_fields(dst), srcb=b, mul=mul, killb=int(neg), killa=1, srca=dsl.reg_operand(a), ext=0x80, tag=0xc0 if wait else 0x00) # Apple: 00 in loop bodies
+    return dsl.FALU_LONG.encode(**dsl.dst_fields(dst), srcb=b, mul=mul, killb=int(neg), srca=dsl.reg_operand(a), ext=0x80, tag=0xc0 if wait else 0x00) # Apple: 00 in loop bodies
 def i_falu_reg(dst,a,bb,mul=0,wait=True): # waiting (six-byte, tail c0) for the first consumer of loads, else the four-byte form, like Apple
-    if wait: return dsl.FALU_LONG.encode(**dsl.dst_fields(dst), srcb=dsl.reg_operand(bb), mul=mul, killa=1, killb=1, srca=dsl.reg_operand(a), tag=0xc0)
-    return dsl.FALU.encode(**dsl.dst_fields(dst), srcb=dsl.reg_operand(bb), mul=mul, killa=1, killb=1, srca=dsl.reg_operand(a))
+    if wait: return dsl.FALU_LONG.encode(**dsl.dst_fields(dst), srcb=dsl.reg_operand(bb), mul=mul, srca=dsl.reg_operand(a), tag=0xc0)
+    return dsl.FALU.encode(**dsl.dst_fields(dst), srcb=dsl.reg_operand(bb), mul=mul, srca=dsl.reg_operand(a))
 def i_fma(dst, a, b, c): # fma rD, rA|#imm, rB, rC|#imm|-rC : rD = rA*rB + rC  (always the waiting tail c0)
-    kw = dict(**dsl.dst_fields(dst), srcb=dsl.reg_operand(b), killa=1, killb=1)
-    if a.startswith('#'): kw.update(srca=dsl.e4m3(float(a[1:]))[0], aimm=1, killa=0)
+    kw = dict(**dsl.dst_fields(dst), srcb=dsl.reg_operand(b))
+    if a.startswith('#'): kw.update(srca=dsl.e4m3(float(a[1:]))[0], aimm=1)
     else: kw.update(srca=dsl.reg_operand(reg(a)))
     if c.startswith('#'):
         e, neg = dsl.e4m3(float(c[1:])); kw.update(c=e & ~1, c_imm=1, c_hi=int(neg))
     else:
-        neg = c.startswith('-'); kw.update(c=reg(c.lstrip('-')) << 1, c_hi=1, c_neg=int(neg))
+        neg = c.startswith('-'); kw.update(c=reg(c.lstrip('-')) << 1, c_neg=int(neg))   # c_hi = kill c (dsl.KILL_MODEL); never set
     return dsl.FMA.encode(**kw)
-def i_store(srcreg, slot, first=False, wait=False, last=False): # every store is followed by its wait, like Apple
-    return dsl.STORE.encode(first=int(first), wait=int(wait), src=srcreg, slot=slot, last=int(last)) + dsl.STORE_WAIT.encode()
+def i_store(srcreg, slot, first=False, wait=False, last=False): return i_store_idx(srcreg, slot, 1, first, wait, last) # buf[t]
 def movimm_bytes(dst, f): return dsl.MOVIMM.encode(**dsl.dst_fields(dst), **dsl.movimm_fields(f))
 def movimm_bits(dst, v): return dsl.MOVIMM.encode(**dsl.dst_fields(dst), **dsl.movimm_bits_fields(v))
 

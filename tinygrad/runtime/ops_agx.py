@@ -1,6 +1,6 @@
 # AGX: hand-assembled Apple GPU machine code on the HCQ2 Metal device. Metal only mints the pipeline state; the GPU runs our bytes.
 from __future__ import annotations
-import ctypes, struct, functools
+import ctypes, struct, functools, bisect
 from tinygrad.helpers import Target
 from tinygrad.device import Compiler
 from tinygrad.renderer import Renderer
@@ -15,14 +15,19 @@ from tinygrad.renderer.agx import dsl
 
 # *****************
 # renderer: linear UOps -> our assembly (tinygrad/runtime/support/agx/asm.py syntax). Naive kernels only: NOOPT=1, no SPECIAL, one thread.
-# registers: r1 is the thread index; floats, constants and loop counters take r2..r14 (4-bit destination fields); int address math takes r16+.
+# registers (dsl.REGISTER_FILE): r1 is the thread index; every value takes the lowest free register in r0, r2..r63 and gives it back after
+# its last read. Loop counters must fit the 4-bit loop_init field (r0..r15) and an addr's shifted operand its 5-bit field (r0..r31): the
+# lowest-free policy keeps both small; the DSL asserts if not. r64..r95 are unused until sources above r63 are hardware-verified.
 
 def cval(u:UOp): # constant value behind CASTs, or None
   while u.op is Ops.CAST: u = u.src[0]
   return u.arg if u.op is Ops.CONST else None
-def base(u:UOp) -> UOp: # look through AFTER to the buffer
-  while u.op is Ops.AFTER: u = u.src[0]
+def strip(u:UOp) -> UOp: # the value-carrying UOp behind CAST/AFTER/NOOP (all no-ops for us: one dtype width, no ordering to keep)
+  while u.op in {Ops.CAST, Ops.AFTER, Ops.NOOP}: u = u.src[0]
   return u
+def is_e4m3(v) -> bool:
+  try: dsl.e4m3(float(v)); return True
+  except ValueError: return False
 
 class AGXCompiler(Compiler):
   def __init__(self): super().__init__(None) # no disk cache: assembling is instant and a stale binary hides ISA changes
@@ -35,11 +40,8 @@ class AGXRenderer(Renderer):
   compiler = AGXCompiler()
 
   def render(self, uops:list[UOp]) -> str:
-    lines, reg, lo, hi = [], {}, 0, 14                         # reg: UOp -> register; lo/hi pools
-    def new_lo():
-      nonlocal lo; lo += 2; assert lo <= 14, "out of low registers"; return lo
-    def new_hi():
-      nonlocal hi; hi += 2; assert hi <= 62, "out of high registers"; return hi
+    lines:list[str] = []
+    pos = {u: i for i, u in enumerate(uops)}
     uses:dict[UOp, list[UOp]] = {}
     for u in uops:
       for src in u.src: uses.setdefault(src, []).append(u)
@@ -47,77 +49,120 @@ class AGXRenderer(Renderer):
     assert [p.arg.slot for p in params] == list(range(len(params))), "buffers must be the call args 0..n-1"
     lines.append(f".buffers {len(params)}")
     slot = {p: p.arg.slot for p in params}
-    done:set[UOp] = set()
+    # fma: a float MUL whose only use is a float ADD folds into it (its operands are then read at the ADD)
+    fused:dict[UOp, UOp] = {}
+    for u in uops:
+      if u.op is Ops.ADD and u.dtype == dtypes.float:
+        for s in u.src:
+          if s.op is Ops.MUL and s.dtype == dtypes.float and uses.get(s) == [u]: fused[s] = u; break   # one product per add
 
+    # liveness: the last position each value is read, looking through INDEX/CAST/AFTER. a value read inside a loop that did not define it
+    # is live until that loop's END (it is read again next iteration).
+    TRANSPARENT = {Ops.INDEX, Ops.CAST, Ops.AFTER, Ops.NOOP}
+    def roots(u:UOp) -> list[UOp]: return [r for s in u.src for r in roots(s)] if u.op in TRANSPARENT else [u]
+    end_of = {e.src[1]: e for e in uops if e.op is Ops.END}
+    last:dict[UOp, int] = {}
+    open_loops:list[UOp] = []
+    for i, u in enumerate(uops):
+      if u.op is Ops.END: open_loops.pop()
+      at = pos[fused[u]] if u in fused else i
+      for s in u.src:
+        for r in roots(s):
+          j = at
+          for l in open_loops:
+            if pos[r] < pos[l]: j = max(j, pos[end_of[l]])
+          last[r] = max(last.get(r, -1), j)
+      if u.op is Ops.RANGE: open_loops.append(u); last[u] = pos[end_of[u]]   # the counter lives for the whole loop
+    dying:dict[int, list[UOp]] = {}
+    for u in uops: dying.setdefault(last.get(u, pos[u]), []).append(u)
+
+    # the register file
+    NREGS, COUNTER_MAX = 64, 15
+    free = sorted(set(range(NREGS)) - {1})
+    owned:dict[UOp, list[int]] = {}    # registers a value gives back when it dies (aliases of an accumulator own nothing)
+    reg:dict[UOp, int] = {}
+    def alloc(u:UOp, limit:int=NREGS - 1) -> int:
+      for r in free:
+        if r <= limit: free.remove(r); owned.setdefault(u, []).append(r); return r
+      raise RuntimeError(f"AGX renderer: out of registers at {u.op} (need r <= {limit}, {len(free)} free); spilling is not implemented")
+    def expire(i:int):
+      for u in dying.get(i, []):
+        for r in owned.pop(u, []): bisect.insort(free, r)
+
+    def val(u:UOp) -> int: # register holding u, materializing constants (movimm) on first use
+      u = strip(u)
+      if u in reg: return reg[u]
+      if u.op is Ops.CONST:
+        d = alloc(u); reg[u] = d
+        lines.append(f"movimm r{d}, #0x{u.arg & 0xffffffff:08x}" if u.dtype in dtypes.ints or u.dtype == dtypes.bool else f"movimm r{d}, #{float(u.arg)}")
+        return d
+      if u.op is Ops.LOAD and u.src[0].op is Ops.INDEX and strip(u.src[0].src[0]).op is Ops.BUFFER: return reg[strip(u.src[0].src[0])]
+      raise RuntimeError(f"AGX renderer: {u.op} has no register")
+    def fsrc(u:UOp) -> str: # float operand: E4M3 immediate or register
+      return f"#{float(cval(u))}" if cval(u) is not None and is_e4m3(cval(u)) else f"r{val(u)}"
+
+    done:set[UOp] = set()
     def intop(u:UOp) -> int: # int ALU op -> register holding its value, via addr (shift-add). emits code.
       if u in reg: return reg[u]
       a, b = u.src[0], u.src[1]
-      if u.op is Ops.MUL and cval(a) is not None: a, b = b, a
-      if u.op is Ops.ADD and cval(a) is not None: a, b = b, a
-      ra = intop(a) if cval(a) is None else None
-      assert ra is not None, f"int op on two constants should have folded: {u}"
-      d = new_hi()
+      if cval(a) is not None: a, b = b, a
+      assert cval(a) is None, f"int op on two constants should have folded: {u}"
+      ra = intop(a) if strip(a).op in {Ops.ADD, Ops.MUL} else val(a)
       if u.op is Ops.MUL:
         n = cval(b); assert n is not None and n > 0 and n & (n - 1) == 0 and n <= 16, f"only power-of-two strides up to 16 for now, got {n}"
-        lines.append(f"addr r{d}, r{ra}, {n.bit_length() - 1}, #0")
+        d = alloc(u); lines.append(f"addr r{d}, r{ra}, {n.bit_length() - 1}, #0")
       elif u.op is Ops.ADD:
-        if cval(b) is not None: lines.append(f"addr r{d}, r{ra}, 0, #{cval(b)}")
-        else: lines.append(f"addr r{d}, r{ra}, 0, r{intop(b)}")
+        rb = None if cval(b) is not None else (intop(b) if strip(b).op in {Ops.ADD, Ops.MUL} else val(b))
+        d = alloc(u); lines.append(f"addr r{d}, r{ra}, 0, " + (f"#{cval(b)}" if rb is None else f"r{rb}"))
       else: raise NotImplementedError(f"int {u.op}")
       reg[u] = d; done.add(u); return d
-
-    def idxreg(idx:UOp) -> int: # register holding an element index (constants go through movimm)
-      if (c:=cval(idx)) is not None:
-        d = new_lo(); lines.append(f"movimm r{d}, #0x{c:08x}"); return d
-      return intop(idx)
-
-    def fsrc(u:UOp) -> str: # float operand: register or E4M3 immediate
-      return f"#{cval(u)}" if cval(u) is not None else f"r{reg[u]}"
+    def idxreg(idx:UOp) -> int: return intop(idx) if strip(idx).op in {Ops.ADD, Ops.MUL} else val(idx)
+    def acc_of(store_or_load:UOp) -> UOp|None: # the register accumulator behind an INDEX, or None for a memory buffer
+      b = strip(store_or_load.src[0].src[0]); return b if b.op is Ops.BUFFER else None
 
     i = 0
     while i < len(uops):
-      u = uops[i]; i += 1
-      if u in done or u.op in {Ops.PARAM, Ops.CONST, Ops.CAST, Ops.AFTER, Ops.SINK, Ops.NOOP, Ops.INDEX}: continue
-      if u.op is Ops.BUFFER: reg[u] = new_lo()                 # a register-resident accumulator
+      u = uops[i]
+      if u in done or u in fused or u.op in {Ops.PARAM, Ops.CONST, Ops.CAST, Ops.AFTER, Ops.SINK, Ops.NOOP, Ops.INDEX}: expire(i); i += 1; continue
+      if u.op is Ops.BUFFER: reg[u] = alloc(u)                  # a register-resident accumulator
       elif u.op is Ops.RANGE:
         n = cval(u.src[0]); assert n is not None, "symbolic loop bounds are not supported yet"
-        c = new_lo()
+        c = alloc(u, COUNTER_MAX)
         lines.append(f"loop r{c}, #{n}")
         # the counter reads 0..n-1 only in the pre section; copy it there so inner loops (where it already reads 1..n) see the 0-based value
-        v = new_hi(); reg[u] = v; lines.append(f"addr r{v}, r{c}, 0, #0")
+        v = alloc(u); reg[u] = v; lines.append(f"addr r{v}, r{c}, 0, #0")
         # pre section: every int op inside this loop that depends only on constants, outer values and this counter
-        depth, j = 0, i
-        while j < len(uops) and not (uops[j].op is Ops.END and uops[j].src[1] is u):
-          v = uops[j]; j += 1
-          if v.dtype == dtypes.int and v.op in {Ops.ADD, Ops.MUL} and all(cval(s) is not None or s in reg or s is u for s in v.src): intop(v)
+        j = i + 1
+        while uops[j] is not end_of[u]:
+          w = uops[j]; j += 1
+          if w.dtype == dtypes.int and w.op in {Ops.ADD, Ops.MUL} and all(cval(s) is not None or strip(s) in reg for s in w.src): intop(w)
         lines.append("body")
       elif u.op is Ops.END: lines.append("endloop")
       elif u.op is Ops.LOAD:
-        ix = u.src[0]; buf = base(ix.src[0])
-        if buf.op is Ops.BUFFER: reg[u] = reg[buf]              # accumulator read: alias
+        ix = u.src[0]
+        if (acc:=acc_of(u)) is not None: reg[u] = reg[acc]      # accumulator read: alias
         else:
-          d = new_lo(); reg[u] = d
-          lines.append(f"load r{d}, {slot[buf]}, r{idxreg(ix.src[1])}"); lines.append("wait")
+          d = alloc(u); reg[u] = d
+          lines.append(f"load r{d}, {slot[strip(ix.src[0])]}, r{idxreg(ix.src[1])}"); lines.append("wait")
       elif u.op is Ops.STORE:
-        ix, v = u.src[0], u.src[1]; buf = base(ix.src[0])
-        if buf.op is Ops.BUFFER:                               # accumulator write
-          acc = reg[buf]
-          if cval(v) is not None: lines.append(f"movimm r{acc}, #{float(cval(v))}")
-          else: assert reg[v] == acc, "value must have been computed into the accumulator"
-        else: lines.append(f"store r{reg[v]}, {slot[buf]}, r{idxreg(ix.src[1])}")
+        ix, v = u.src[0], u.src[1]
+        if (acc:=acc_of(u)) is not None:                        # accumulator write
+          if cval(v) is not None: lines.append(f"movimm r{reg[acc]}, #{float(cval(v))}")
+          else: assert reg[strip(v)] == reg[acc], "value must have been computed into the accumulator"
+        else: lines.append(f"store r{val(v)}, {slot[strip(ix.src[0])]}, r{idxreg(ix.src[1])}")
       elif u.op in {Ops.ADD, Ops.MUL} and u.dtype == dtypes.float:
         us = uses.get(u, [])
-        if u.op is Ops.MUL and len(us) == 1 and us[0].op is Ops.ADD and us[0].dtype == dtypes.float: continue   # fused by the ADD below
-        # destination: the accumulator when this value's only use is an accumulator store
-        dst = reg[base(us[0].src[0].src[0])] if len(us) == 1 and us[0].op is Ops.STORE and base(us[0].src[0].src[0]).op is Ops.BUFFER else new_lo()
+        # destination: the accumulator when this value's only use is an accumulator store, else a fresh register
+        if len(us) == 1 and us[0].op is Ops.STORE and (acc:=acc_of(us[0])) is not None: dst = reg[acc]
+        else: dst = alloc(u)
         reg[u] = dst
         a, b = u.src
-        if u.op is Ops.ADD and b.op is Ops.MUL and b.dtype == dtypes.float and len(uses.get(b, [])) == 1 and b not in reg: a, b = b, a
-        if u.op is Ops.ADD and a.op is Ops.MUL and a.dtype == dtypes.float and len(uses.get(a, [])) == 1 and a not in reg:
-          done.add(a); lines.append(f"fma r{dst}, {fsrc(a.src[0])}, r{reg[a.src[1]]}, {fsrc(b)}")   # a*b + c fused
-        else: lines.append(f"{'fadd' if u.op is Ops.ADD else 'fmul'} r{dst}, r{reg[a]}, {fsrc(b)}")
+        if u.op is Ops.ADD and fused.get(b) is u: a, b = b, a
+        if u.op is Ops.ADD and fused.get(a) is u: lines.append(f"fma r{dst}, {fsrc(a.src[0])}, r{val(a.src[1])}, {fsrc(b)}")   # a*b + c fused
+        else: lines.append(f"{'fadd' if u.op is Ops.ADD else 'fmul'} r{dst}, r{val(a)}, {fsrc(b)}")
       elif u.op in {Ops.ADD, Ops.MUL} and u.dtype == dtypes.int: intop(u)
       else: raise NotImplementedError(f"AGX renderer: {u.op} {u.dtype}")
+      expire(i); i += 1
     return "\n".join(lines) + "\n"
 
 # *****************
