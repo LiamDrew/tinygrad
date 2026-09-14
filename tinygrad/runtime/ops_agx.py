@@ -25,9 +25,10 @@ store r2, 0
 
 class AGXCompiler(Compiler):
   def __init__(self): super().__init__("compile_agx")
-  def compile(self, src:str) -> bytes:
-    lib = asm.build(src)[0]
-    if DEBUG >= 4: self.disassemble(lib) # hcq2's own DEBUG>=5 printers cannot render a submit yet, so show the bytes here
+  def compile(self, src:str) -> bytes: return asm.build(src)[0]
+  def compile_cached(self, src:str) -> bytes:
+    lib = super().compile_cached(src)
+    if DEBUG >= 4: self.disassemble(lib) # hcq2's DEBUG>=5 printers cannot render a submit yet, so show the bytes here, cache hit or not
     return lib
   def disassemble(self, lib:bytes): print(dsl.disasm_str(text_section(split_archive(lib)[0])))
 
