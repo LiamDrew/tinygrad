@@ -99,7 +99,7 @@ ADDR = Inst("addr", bytes.fromhex("9f115400020000881004"), (
   Field("noshift", B(8, 0), 1),
   Field("breg", B(9, 0), 1),
   Field("shift1", B(9, 4), 1)),
-  doc="dst = (a << shift) + b: integer shift-add. A loaded operand must have been waited on (a waiting consumer before this op)")
+  doc="dst = (a << shift) + b: integer shift-add for address math. b as a register is only safe for small non-negative values (IADD doc)")
 # multiply: dst = r1 * stride. 12-byte form, stride in bits [15:2] (probes: 7t -> 1c 00, 100t -> 90 01); the low two bits are ignored.
 IMUL = Inst("imul", bytes.fromhex("9f1054000204000050200200"), (
   Field("dst", B(3, 1), 7),
@@ -139,7 +139,9 @@ Apple's later six-byte ops carry tails 00 20 / 00 40; those do not work as the f
 KILL_MODEL = """Operand kill bits are real semantics, not hints (hardware-verified 2026-09-14): after an op with a source's kill bit set, that
 register reads as 0. Apple's compiler sets them on the last use of every value (register release). Ours: the assembler sets none by default; a
 value read twice (fadd r4, r0, r2 / fadd r6, r0, r2) came back 0 while every kill bit was set. Kill bits found so far: FALU/FMA killa, killb;
-FMA c_hi (its register c); LOAD/STORE byte5 bit7 (areg). The old renderer only survived because every register was read exactly once."""
+FMA c_hi (its register c); LOAD/STORE byte5 bit7 (areg); IADD/ISUB/INEG byte8 bits 1,2; IMUL_RR byte9 bits 1,2; the 0x0b bitwise and 0x02
+min/max/select/compare families byte2 bits 3,4 (FALU layout), ISEL c byte4 bit7 and e byte8 bit7. Every probe-derived template must be checked
+by running the op twice on the same operands. The old renderer only survived because every register was read exactly once."""
 # float ALU. 4-byte form: [09 | dst<<4] [srcb] [mod] [srca]. mod bit2 adds the two-byte tail (FALU_LONG); mod bit1 adds an fma third operand.
 # destination registers: the 4-bit nibble in byte 0 holds bits [3:0]; bits [5:4] sit in the mod byte's top two bits (probes/live24, live48:
 # fadd r21 = 59 b1 54, r40 = 89 b1 94; Apple never writes above r63 with these forms, even with 96 values live). Same split for MOVIMM.
@@ -170,6 +172,48 @@ FMA = Inst("fma", bytes.fromhex("090006000100 02c0"), (
   Field("c", B(5), 8),              # register << 1, or E4M3 immediate without its low bit
   Field("negp", B(7, 3), 1), Field("aimm", B(7, 1), 1)),
   doc="dst = srca * srcb + c")
+# ---- integer ALU (probes/int/*.metal, 2026-09-14; every form hardware-verified with a in r0, b in r2, plus re-reads for the kill bits) ----
+# add/sub/mul are the ADDR family (10 or 12 bytes, 7-bit dst in byte 3, b in byte 5, a in byte 6 bits 3..7). Opcode byte 0x1f subtracts: dst = b - a.
+# int add reg-reg and reg-imm are ADDR with shift 0. Apple's iadd (9f 01 56 ...) differs from ADDR only in flag bits we do not need.
+# byte 7 bit 5 = b is a 32-bit register (without it -3 read as 65533, so ADDR's register form is 16-bit); byte 8 bits 1,2 = operand kill bits
+# (Apple's 17: both operands died; re-reading them gave 0). We emit a8 11.
+IADD = Inst("iadd", bytes.fromhex("9f015600020000a81105"), (
+  Field("dst", B(3, 1), 7), Field("breg", B(5, 2), 6), Field("a", B(6, 3), 5), Field("killb", B(8, 1), 1), Field("killa", B(8, 2), 1)),
+  doc="dst = a + b, 32-bit. Use this, not ADDR's register form, for values")
+ISUB = Inst("isub", bytes.fromhex("1f01560002000 0a81105".replace(" ", "")), tuple(IADD.fields), doc="dst = b - a")
+INEG = Inst("ineg", bytes.fromhex("1f015600020000881104"), (Field("dst", B(3, 1), 7), Field("a", B(6, 3), 5), Field("killa", B(8, 2), 1)),
+  doc="dst = 0 - a (ISUB with immediate b = 0; Apple's 15 kills a)")
+IMUL_RR = Inst("imul", bytes.fromhex("9f00560002000000d0200a00"), (
+  Field("dst", B(3, 1), 7), Field("breg", B(5, 2), 6), Field("a", B(6, 3), 5), Field("killb", B(9, 1), 1), Field("killa", B(9, 2), 1)),
+  doc="dst = a * b (32-bit); IMUL is the thread-index-times-stride form. Apple's byte 9 = 26: both operands killed")
+# the 0x0b bitwise family, 10 bytes: FALU-style operands (byte 1 = srcb, byte 3 = srca, dst nibble + DST_HI), byte 2 bits 3,4 = kills. Bytes 2, 4, 5
+# select the function (Apple: and 1f/00 00, or 1f/02 08, xor 1e/02 08 with the kills set); byte 5 is not an operand (moving b left it unchanged).
+_BIT = lambda name, hexs, doc: Inst(name, bytes.fromhex(hexs), (Field("dst", B(0, 4), 4), Field("srcb", B(1), 8), Field("killb", B(2, 3), 1), Field("killa", B(2, 4), 1),
+                                                                 DST_HI, Field("srca", B(3), 8)), doc=doc)
+IAND = _BIT("iand", "0b000700000000800000", "dst = srca & srcb")
+IOR  = _BIT("ior",  "0b000700020800800000", "dst = srca | srcb")
+IXOR = _BIT("ixor", "0b000600020800800000", "dst = srca ^ srcb")
+# the 0x02 family: byte 2 bits 0..2 pick the form. 1e = min/max (6 bytes, byte 4: 06 max, 07 min), 1f = select (8 or 10 bytes), 1d = compare (8 bytes).
+IMAX = Inst("imax", bytes.fromhex("020006000 6c0".replace(" ", "")), (Field("dst", B(0, 4), 4), Field("srcb", B(1), 8), Field("killb", B(2, 3), 1), Field("killa", B(2, 4), 1),
+                                                                    DST_HI, Field("srca", B(3), 8)), doc="dst = max(srca, srcb), signed")
+IMIN = Inst("imin", bytes.fromhex("0200060007c0"), tuple(IMAX.fields), doc="dst = min(srca, srcb), signed")
+# select: dst = (srcb < srca) ? c : srcb (8 bytes), or ? c : e with byte 4 bit 1 and two more bytes (10). Kills: c byte 4 bit 7, e byte 8 bit 7.
+# byte 4 bit 0 is required in the 8-byte form (cleared: wrong results); the 10-byte form has bit 1 instead
+ISEL = Inst("isel", bytes.fromhex("0200070001000 7c0".replace(" ", "")), (Field("dst", B(0, 4), 4), Field("srcb", B(1), 8), Field("killb", B(2, 3), 1), Field("killa", B(2, 4), 1),
+  DST_HI, Field("srca", B(3), 8), Field("killc", B(4, 7), 1), Field("c", B(5, 1), 7)),
+  doc="dst = srcb < srca ? c : (else). Apple's 8-byte form; with the kill bit off the false case read 0, so the assembler only emits ISEL4")
+ISEL4 = Inst("isel", bytes.fromhex("0200070002000 7c00000".replace(" ", "")), tuple(ISEL.fields) + (Field("kille", B(8, 7), 1), Field("e", B(9, 1), 7)),
+  doc="dst = srcb < srca ? c : e (signed)")
+# compare: dst = srcb OP srca as 0/1. The 8-byte compare must be followed by the 6-byte 20 8x 13 00 00 01 (its nibble does nothing; without it the
+# register stays 0), so the table carries both as one 14-byte instruction. Codes (byte 4, byte 5 bit 0, byte 6, byte 9 bit 0):
+CMP_CODES = {"lt": (0x22, 1, 7, 0), "gt": (0x22, 1, 6, 0), "ult": (0x22, 1, 5, 0), "eq": (0x26, 1, 7, 0), "ne": (0x26, 0, 7, 1)}
+ICMP = Inst("icmp", bytes.fromhex("020005000080 00c0 2080 13000001".replace(" ", "")), (Field("dst", B(0, 4), 4), Field("srcb", B(1), 8), Field("killb", B(2, 3), 1),
+  Field("killa", B(2, 4), 1), DST_HI, Field("srca", B(3), 8), Field("k4", B(4), 8), Field("k5", B(5, 0), 1), Field("code", B(6), 8), Field("inv", B(9, 0), 1)),
+  doc="dst = (srcb OP srca) ? 1 : 0; OP from CMP_CODES (lt gt eq ne signed, ult unsigned)")
+def cmp_fields(op:str) -> dict[str, int]:
+  k4, k5, code, inv = CMP_CODES[op]; return dict(k4=k4, k5=k5, code=code, inv=inv)
+def cmp_name(d:dict[str, int]) -> str: return next((n for n, v in CMP_CODES.items() if v == (d["k4"], d["k5"], d["code"], d["inv"])), f"?{d['k4']:02x}{d['k5']}{d['code']}{d['inv']}")
+
 # 32-bit immediate, scattered (single-bit probes against 42.0 = 0x42280000, 2026-09-14; bits 0..8 come from Apple's 3.14159 encoding ac d0 42 40 1e 04 48 02,
 # the compiler switches to another form when only low bits change). Earlier layout lost bits 0..12: movimm r26, #3.14159 stored 3.1420898.
 MOVIMM = Inst("movimm", bytes.fromhex("0c80020000000000"), (
@@ -191,7 +235,7 @@ STORE_WAIT = Inst("store_wait", bytes.fromhex("110000901100"),
   doc="wait for the preceding store. Apple emits one after every store; two stores back to back lose data without it (test_agx)")
 BARRIER = STORE_WAIT # old name
 
-TABLE = (LOAD, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
+TABLE = (LOAD, IADD, ISUB, INEG, IMUL_RR, IAND, IOR, IXOR, IMAX, IMIN, ISEL4, ISEL, ICMP, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
 
 def movimm_bits_fields(v:int) -> dict[str, int]: return {n: (v >> lo) & ((1 << w) - 1) for n, lo, w in _MOVIMM_SLICES}
 def movimm_fields(f:float) -> dict[str, int]: return movimm_bits_fields(struct.unpack("<I", struct.pack("<f", f))[0])
@@ -222,6 +266,16 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
     c = f"#{'-' if d['c_hi'] else ''}{e4m3_value(d['c'] | 1):g}" if d["c_imm"] else f"{'-' if d['c_neg'] else ''}r{d['c'] >> 1}"
     return f"fma r{dst_reg(d)}, {'-' if d['negp'] else ''}{a}, r{operand_reg(d['srcb'])}, {c}" + "".join(f" ; {n}" for n in ("killa", "killb", "fwd") if d[n])
   if inst is MOVIMM: return f"movimm r{dst_reg(d)}, #{movimm_value(d):g}"
+  if inst is IADD: return f"iadd r{d['dst']}, r{d['a']}, r{d['breg']}"
+  if inst is ISUB: return f"isub r{d['dst']}, r{d['breg']}, r{d['a']}"
+  if inst is INEG: return f"ineg r{d['dst']}, r{d['a']}"
+  if inst is IMUL_RR: return f"imul r{d['dst']}, r{d['a']}, r{d['breg']}"
+  if inst in (IAND, IOR, IXOR, IMAX, IMIN):
+    return f"{inst.mnemonic} r{dst_reg(d)}, r{operand_reg(d['srca'])}, r{operand_reg(d['srcb'])}" + "".join(f" ; {n}" for n in ("killa", "killb") if d[n])
+  if inst is ISEL or inst is ISEL4:
+    e = f"r{d['e']}" if inst is ISEL4 else f"r{operand_reg(d['srcb'])}"
+    return f"isel r{dst_reg(d)}, r{operand_reg(d['srcb'])}, r{operand_reg(d['srca'])}, r{d['c']}, {e}" + "".join(f" ; {n}" for n in ("killa", "killb", "killc", "kille") if d.get(n))
+  if inst is ICMP: return f"icmp.{cmp_name(d)} r{dst_reg(d)}, r{operand_reg(d['srcb'])}, r{operand_reg(d['srca'])}" + "".join(f" ; {n}" for n in ("killa", "killb") if d[n])
   return inst.mnemonic
 
 def disassemble(code:bytes, entry:int=0x40) -> list[tuple[int, bytes, str]]:

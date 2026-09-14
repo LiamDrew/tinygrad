@@ -71,8 +71,24 @@ def assemble_text(program):
             a = reg(p[2]) if len(p) > 4 else 1; sh, b = (int(p[3]), p[4]) if len(p) > 4 else (int(p[2]), p[3])
             if b.startswith('#'): main+=i_addr(reg(p[1]), sh, imm=int(b[1:]), a=a)
             else: main+=i_addr(reg(p[1]), sh, breg=reg(b), a=a)
-        elif op=='imul':                                 # imul rD, #stride : rD = t * stride
+        elif op=='imul' and len(p)==3:                   # imul rD, #stride : rD = t * stride
             main+=i_imul(reg(p[1]), int(p[2].lstrip('#')))
+        elif op=='imul':                                 # imul rD, rA, rB : rD = rA * rB
+            main+=dsl.IMUL_RR.encode(dst=reg(p[1]), a=reg(p[2]), breg=reg(p[3])); pending=False
+        elif op=='iadd':                                 # iadd rD, rA, rB : rD = rA + rB (32-bit)
+            main+=dsl.IADD.encode(dst=reg(p[1]), a=reg(p[2]), breg=reg(p[3])); pending=False
+        elif op=='isub':                                 # isub rD, rA, rB : rD = rA - rB
+            main+=dsl.ISUB.encode(dst=reg(p[1]), breg=reg(p[2]), a=reg(p[3])); pending=False
+        elif op=='ineg':                                 # ineg rD, rA
+            main+=dsl.INEG.encode(dst=reg(p[1]), a=reg(p[2])); pending=False
+        elif op in ('iand','ior','ixor','imax','imin'):  # op rD, rA, rB
+            inst={'iand':dsl.IAND,'ior':dsl.IOR,'ixor':dsl.IXOR,'imax':dsl.IMAX,'imin':dsl.IMIN}[op]
+            main+=inst.encode(**dsl.dst_fields(reg(p[1])), srca=dsl.reg_operand(reg(p[2])), srcb=dsl.reg_operand(reg(p[3]))); pending=False
+        elif op=='isel':                                 # isel rD, rA, rB, rC [, rE] : rD = (rA < rB) ? rC : rE (rE defaults to rA)
+            kw=dict(**dsl.dst_fields(reg(p[1])), srcb=dsl.reg_operand(reg(p[2])), srca=dsl.reg_operand(reg(p[3])), c=reg(p[4]))
+            main+=dsl.ISEL4.encode(**kw, e=reg(p[5]) if len(p)>5 else reg(p[2])); pending=False   # always the explicit-else form (ISEL's implicit else is not understood)
+        elif op.startswith('icmp.'):                     # icmp.lt|gt|ult|eq|ne rD, rA, rB : rD = (rA op rB) ? 1 : 0
+            main+=dsl.ICMP.encode(**dsl.dst_fields(reg(p[1])), srcb=dsl.reg_operand(reg(p[2])), srca=dsl.reg_operand(reg(p[3])), **dsl.cmp_fields(op[5:])); pending=False
         elif op=='loop':                                 # loop rC, #n [pre] body [post] endloop
             init, inc = loop_head(reg(p[1]), int(p[2].lstrip('#')), len(loops))  # pre: ALU-only, sees rC = 0..n-1 (Apple's layout); post: the rest, rC = 1..n
             main+=init; loops.append((len(main), inc)); pending=False # loop_init's tail waits for pending loads
@@ -82,6 +98,8 @@ def assemble_text(program):
             start, _ = loops.pop(); main+=loop_tail(len(main) - start, len(loops))
         elif op=='wait':
             main+=i_wait()
+        elif op=='raw':                                  # raw <hex bytes>: an instruction under investigation (experiments only)
+            main+=bytes.fromhex(''.join(p[1:])); pending=False
         elif op in ('fadd','fmul'):
             d=reg(p[1]); a=reg(p[2]); mul=int(op=='fmul')
             if p[3].startswith('#'):

@@ -55,6 +55,9 @@ class AGXRenderer(Renderer):
       if u.op is Ops.ADD and u.dtype == dtypes.float:
         for s in u.src:
           if s.op is Ops.MUL and s.dtype == dtypes.float and uses.get(s) == [u]: fused[s] = u; break   # one product per add
+      # an int compare whose only use is a WHERE folds into the select (isel compares and selects in one op)
+      if u.op is Ops.WHERE and (c:=strip(u.src[0])).op is Ops.CMPLT and c.src[0].dtype in dtypes.ints and uses.get(c) == [u.src[0]] and (u.src[0] is c or uses.get(u.src[0]) == [u]):
+        fused[c] = u
 
     # liveness: the last position each value is read, looking through INDEX/CAST/AFTER. a value read inside a loop that did not define it
     # is live until that loop's END (it is read again next iteration).
@@ -89,12 +92,14 @@ class AGXRenderer(Renderer):
       for u in dying.get(i, []):
         for r in owned.pop(u, []): bisect.insort(free, r)
 
+    INT2 = {Ops.SUB: "isub", Ops.AND: "iand", Ops.OR: "ior", Ops.XOR: "ixor", Ops.MAX: "imax", Ops.CMPLT: "icmp.lt", Ops.CMPNE: "icmp.ne", Ops.CMPEQ: "icmp.eq"}
+    def is_int(u:UOp) -> bool: return dtypes.is_int(u.dtype) or u.dtype == dtypes.bool   # dtypes.is_int includes the weak int of constants
     def val(u:UOp) -> int: # register holding u, materializing constants (movimm) on first use
       u = strip(u)
       if u in reg: return reg[u]
       if u.op is Ops.CONST:
         d = alloc(u); reg[u] = d
-        lines.append(f"movimm r{d}, #0x{u.arg & 0xffffffff:08x}" if u.dtype in dtypes.ints or u.dtype == dtypes.bool else f"movimm r{d}, #{float(u.arg)}")
+        lines.append(f"movimm r{d}, #0x{int(u.arg) & 0xffffffff:08x}" if is_int(u) else f"movimm r{d}, #{float(u.arg)}")   # weak int consts count
         return d
       if u.op is Ops.LOAD and u.src[0].op is Ops.INDEX and strip(u.src[0].src[0]).op is Ops.BUFFER: return reg[strip(u.src[0].src[0])]
       raise RuntimeError(f"AGX renderer: {u.op} has no register")
@@ -102,19 +107,23 @@ class AGXRenderer(Renderer):
       return f"#{float(cval(u))}" if cval(u) is not None and is_e4m3(cval(u)) else f"r{val(u)}"
 
     done:set[UOp] = set()
-    def intop(u:UOp) -> int: # int ALU op -> register holding its value, via addr (shift-add). emits code.
+    def intop(u:UOp) -> int: # int ADD/MUL -> register holding its value: addr (shift-add) for address math, imul otherwise. emits code.
       if u in reg: return reg[u]
       a, b = u.src[0], u.src[1]
       if cval(a) is not None: a, b = b, a
       assert cval(a) is None, f"int op on two constants should have folded: {u}"
       ra = intop(a) if strip(a).op in {Ops.ADD, Ops.MUL} else val(a)
-      if u.op is Ops.MUL:
-        n = cval(b); assert n is not None and n > 0 and n & (n - 1) == 0 and n <= 16, f"only power-of-two strides up to 16 for now, got {n}"
+      n = cval(b)
+      if u.op is Ops.MUL and n is not None and n > 0 and n & (n - 1) == 0 and n <= 16:
         d = alloc(u); lines.append(f"addr r{d}, r{ra}, {n.bit_length() - 1}, #0")
-      elif u.op is Ops.ADD:
-        rb = None if cval(b) is not None else (intop(b) if strip(b).op in {Ops.ADD, Ops.MUL} else val(b))
-        d = alloc(u); lines.append(f"addr r{d}, r{ra}, 0, " + (f"#{cval(b)}" if rb is None else f"r{rb}"))
-      else: raise NotImplementedError(f"int {u.op}")
+      elif u.op is Ops.MUL:
+        rb = intop(b) if strip(b).op in {Ops.ADD, Ops.MUL} else val(b)
+        d = alloc(u); lines.append(f"imul r{d}, r{ra}, r{rb}")
+      elif n is not None and 0 <= n < 128:
+        d = alloc(u); lines.append(f"addr r{d}, r{ra}, 0, #{n}")
+      else:
+        rb = intop(b) if strip(b).op in {Ops.ADD, Ops.MUL} else val(b)
+        d = alloc(u); lines.append(f"iadd r{d}, r{ra}, r{rb}")
       reg[u] = d; done.add(u); return d
     def idxreg(idx:UOp) -> int: return intop(idx) if strip(idx).op in {Ops.ADD, Ops.MUL} else val(idx)
     def acc_of(store_or_load:UOp) -> UOp|None: # the register accumulator behind an INDEX, or None for a memory buffer
@@ -149,7 +158,9 @@ class AGXRenderer(Renderer):
         if (acc:=acc_of(u)) is not None:                        # accumulator write
           if cval(v) is not None: lines.append(f"movimm r{reg[acc]}, #{float(cval(v))}")
           else: assert reg[strip(v)] == reg[acc], "value must have been computed into the accumulator"
-        else: lines.append(f"store r{val(v)}, {slot[strip(ix.src[0])]}, r{idxreg(ix.src[1])}")
+        else:
+          assert v.dtype.itemsize == 4, f"only 32-bit stores for now, not {v.dtype}"
+          lines.append(f"store r{val(v)}, {slot[strip(ix.src[0])]}, r{idxreg(ix.src[1])}")
       elif u.op in {Ops.ADD, Ops.MUL} and u.dtype == dtypes.float:
         us = uses.get(u, [])
         # destination: the accumulator when this value's only use is an accumulator store, else a fresh register
@@ -160,7 +171,20 @@ class AGXRenderer(Renderer):
         if u.op is Ops.ADD and fused.get(b) is u: a, b = b, a
         if u.op is Ops.ADD and fused.get(a) is u: lines.append(f"fma r{dst}, {fsrc(a.src[0])}, r{val(a.src[1])}, {fsrc(b)}")   # a*b + c fused
         else: lines.append(f"{'fadd' if u.op is Ops.ADD else 'fmul'} r{dst}, r{val(a)}, {fsrc(b)}")
-      elif u.op in {Ops.ADD, Ops.MUL} and u.dtype == dtypes.int: intop(u)
+      elif u.op in {Ops.ADD, Ops.MUL} and u.dtype in dtypes.ints: intop(u)
+      elif u.op in INT2 and is_int(u.src[0]):                  # int binary ops and compares: registers only (constants are materialized)
+        ra, rb = val(u.src[0]), val(u.src[1])
+        mn = "icmp.ult" if u.op is Ops.CMPLT and u.src[0].dtype in dtypes.uints else INT2[u.op]
+        d = alloc(u); reg[u] = d; lines.append(f"{mn} r{d}, r{ra}, r{rb}")
+      elif u.op is Ops.NEG and is_int(u):
+        ra = val(u.src[0]); d = alloc(u); reg[u] = d; lines.append(f"ineg r{d}, r{ra}")
+      elif u.op is Ops.WHERE and is_int(u):
+        c, x, y = u.src
+        if fused.get(strip(c)) is u: ra, rb = val(strip(c).src[0]), val(strip(c).src[1])       # (a < b) ? x : y
+        else: ra, rb = None, val(c)                                                              # (0 < cond) ? x : y, zero register below
+        rx, ry = val(x), val(y)
+        if ra is None: ra = alloc(u); lines.append(f"movimm r{ra}, #0x00000000")
+        d = alloc(u); reg[u] = d; lines.append(f"isel r{d}, r{ra}, r{rb}, r{rx}, r{ry}")
       else: raise NotImplementedError(f"AGX renderer: {u.op} {u.dtype}")
       expire(i); i += 1
     return "\n".join(lines) + "\n"

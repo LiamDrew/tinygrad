@@ -39,6 +39,17 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
     self.assertIn("movimm r0, #42", body)
     self.assertIn("fadd r0, r0, #-3.5 ; killb ; tag 00", body) # no loads pending: not a waiting op. killb carries the immediate's sign
 
+  def test_int_roundtrip(self): # the int mnemonics assemble to the hardware-verified bytes and read back
+    src = ("load r0, 1\nwait\nload r2, 2\nwait\nisub r4, r0, r2\nineg r5, r0\nimul r6, r0, r2\niand r7, r0, r2\nior r8, r0, r2\nixor r9, r0, r2\n"
+           "imax r10, r0, r2\nimin r22, r0, r2\nisel r12, r0, r2, r4\nisel r13, r0, r2, r4, r5\nicmp.lt r14, r0, r2\nicmp.ne r30, r0, r2\nstore r4, 0\n")
+    text, _, _ = asm.assemble_text(src)
+    body = [(bs.hex(), t) for _, bs, t in dsl.disassemble(text)][6:-3]
+    self.assertEqual([t for _, t in body], ["isub r4, r0, r2", "ineg r5, r0", "imul r6, r0, r2", "iand r7, r0, r2", "ior r8, r0, r2", "ixor r9, r0, r2",
+                                            "imax r10, r0, r2", "imin r22, r0, r2", "isel r12, r0, r2, r4, r0", "isel r13, r0, r2, r4, r5",
+                                            "icmp.lt r14, r0, r2", "icmp.ne r30, r0, r2"])
+    self.assertEqual(body[0][0], "1f01560802001 0a81105".replace(" ", ""))   # verified on hardware: a - b into r4, kill bits clear (Apple: 17)
+    self.assertEqual(body[3][0], "7b050701000000800000")                     # and, kill bits clear (07, Apple: 1f)
+
 @unittest.skipUnless(Device.DEFAULT == "AGX", "AGX device required")
 class TestAGX(unittest.TestCase):
   def test_add_two_numbers(self):
@@ -89,6 +100,43 @@ class TestAGX(unittest.TestCase):
     with patch.object(ops_agx.AGXRenderer, "render", lambda self, uops: src):
       x, y = Tensor(a).contiguous().realize(), Tensor(b).contiguous().realize()
       return (x + y).tolist()
+
+  def run_asm_int(self, src:str, a:int, b:int) -> int: # int32 data: data0 = f(data1, data2), a in r0 and b in r2 by the kernel's own loads
+    from tinygrad import dtypes
+    from tinygrad.runtime import ops_agx
+    from tinygrad import codegen
+    from tinygrad.runtime.support import hcq2
+    from tinygrad.engine import realize
+    for c in (codegen.to_program_cache, hcq2.hcq_compile_cache, hcq2.link_linear_cache, realize.runtime_cache): c.clear()
+    Device[Device.DEFAULT].wait_timeout_ms = 10000.0
+    with patch.object(ops_agx.AGXRenderer, "render", lambda self, uops: ".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\n" + src):
+      x, y = Tensor([a], dtype=dtypes.int32).contiguous().realize(), Tensor([b], dtype=dtypes.int32).contiguous().realize()
+      return (x + y).item()
+
+  def test_int_ops(self): # probes/int/*.metal: one op each on a=5, b=3 (and 3, 5 where the order matters)
+    for src, want in [("isub r4, r0, r2\nstore r4, 0\n", 2), ("ineg r4, r0\nstore r4, 0\n", -5), ("imul r4, r0, r2\nstore r4, 0\n", 15),
+                      ("iand r4, r0, r2\nstore r4, 0\n", 1), ("ior r4, r0, r2\nstore r4, 0\n", 7), ("ixor r4, r0, r2\nstore r4, 0\n", 6),
+                      ("imax r4, r0, r2\nstore r4, 0\n", 5), ("imin r22, r0, r2\nstore r22, 0\n", 3), ("icmp.gt r4, r0, r2\nstore r4, 0\n", 1),
+                      ("icmp.eq r4, r0, r2\nstore r4, 0\n", 0), ("icmp.ne r4, r0, r2\nstore r4, 0\n", 1)]:
+      with self.subTest(src=src.split("\n")[0]): self.assertEqual(self.run_asm_int(src, 5, 3), want)
+
+  def test_int_compare_select(self):
+    for a, b, src, want in [(3, 5, "icmp.lt r4, r0, r2\nstore r4, 0\n", 1), (5, 3, "icmp.lt r4, r0, r2\nstore r4, 0\n", 0), (-1, 5, "icmp.lt r4, r0, r2\nstore r4, 0\n", 1),
+                            (-1, 5, "icmp.ult r4, r0, r2\nstore r4, 0\n", 0), (3, 3, "icmp.eq r4, r0, r2\nstore r4, 0\n", 1),
+                            (3, 5, "movimm r4, #0x00000009\nisel r6, r0, r2, r4, r2\nstore r6, 0\n", 9), (5, 3, "movimm r4, #0x00000009\nisel r6, r0, r2, r4, r2\nstore r6, 0\n", 3)]:
+      with self.subTest(a=a, b=b, src=src.split("\n")[-2]): self.assertEqual(self.run_asm_int(src, a, b), want)
+
+  def test_int_tensors(self): # the renderer lowers tinygrad's int ops
+    from tinygrad import dtypes
+    from tinygrad.helpers import Context
+    A, B = [5, -2, 7, 0], [3, 3, -7, 1]
+    a, b = Tensor(A, dtype=dtypes.int32).contiguous().realize(), Tensor(B, dtype=dtypes.int32).contiguous().realize()
+    with Context(NOOPT=1):
+      for name, t, want in [("sub", a - b, [x - y for x, y in zip(A, B)]), ("mul", a * b, [x * y for x, y in zip(A, B)]), ("and", a & b, [x & y for x, y in zip(A, B)]),
+                            ("or", a | b, [x | y for x, y in zip(A, B)]), ("xor", a ^ b, [x ^ y for x, y in zip(A, B)]), ("max", a.maximum(b), [max(x, y) for x, y in zip(A, B)]),
+                            ("where", (a < b).where(a, b), [x if x < y else y for x, y in zip(A, B)]),
+                            ("ne", (a != b).cast(dtypes.int32), [int(x != y) for x, y in zip(A, B)]), ("mul7", a * 7, [x * 7 for x in A])]:
+        with self.subTest(op=name): self.assertEqual(t.tolist(), want)
 
   def test_kill_model(self): # dsl.KILL_MODEL: with no kill bits set, a register can be read again after an op, a load and a store
     self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nfadd r4, r0, r2\nfadd r6, r0, r2\nstore r6, 0\n", 1.5, 2.25), 3.75)
