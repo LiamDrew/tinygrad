@@ -10,7 +10,7 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
     text, n, written = asm.assemble_text(src)
     self.assertEqual((n, written), (3, {0}))
     body = [t for _, _, t in dsl.disassemble(text)]
-    self.assertEqual(body, [".preamble 64 bytes", "get_tid", "load r0, 1, r1 ; first ; more", "wait", "load r2, 2, r1", "wait", "fadd r4, r0, r2",
+    self.assertEqual(body, [".preamble 64 bytes", "getsr r1, tid.x", "load r0, 1, r1 ; first ; more", "wait", "load r2, 2, r1", "wait", "fadd r4, r0, r2",
                             "store r4, 0, r1 ; last", "store_wait", "stop"])
     self.assertFalse(any(t.startswith(".short") for t in body), "every emitted byte decodes")
 
@@ -161,6 +161,42 @@ class TestAGX(unittest.TestCase):
                             ("cmp2f", (a < 3).float(), [float(x < 3) for x in A]), ("mixed", a.float() * f, [x * y for x, y in zip(A, F)])]:
         with self.subTest(op=name): self.assertEqual(t.tolist(), [struct.unpack("f", struct.pack("f", w))[0] if isinstance(w, float) else w for w in want])
 
+  def run_asm_dims(self, src:str, dims:tuple) -> list[int]: # int32 out[0..7] under a (gx, gy, gz, lx, ly, lz) dispatch; store via r1 = tid.x unless src stores itself
+    from tinygrad import dtypes
+    from tinygrad.runtime import ops_agx, ops_metal
+    from tinygrad import codegen
+    from tinygrad.runtime.support import hcq2
+    from tinygrad.engine import realize
+    for c in (codegen.to_program_cache, hcq2.hcq_compile_cache, hcq2.link_linear_cache, realize.runtime_cache): c.clear()
+    Device[Device.DEFAULT].wait_timeout_ms = 10000.0
+    with patch.object(ops_agx.AGXRenderer, "render", lambda self, uops: ".buffers 3\n" + src), patch.object(ops_metal.MetalQueue, "dims", staticmethod(lambda prg: dims)):
+      x, y = Tensor(list(range(8)), dtype=dtypes.int32).contiguous().realize(), Tensor(list(range(8)), dtype=dtypes.int32).contiguous().realize()
+      return (x + y).tolist()
+
+  def test_special_registers(self): # probes/sr: 4 threadgroups of 2 threads; the prologue's tid.x is the flat index
+    self.assertEqual(self.run_asm_dims("getsr r2, tid.x\nstore r2, 0\n", (4, 1, 1, 2, 1, 1)), list(range(8)))
+    self.assertEqual(self.run_asm_dims("getsr r2, gid.x\nstore r2, 0\n", (4, 1, 1, 2, 1, 1)), [0, 0, 1, 1, 2, 2, 3, 3])
+    self.assertEqual(self.run_asm_dims("getsr r2, lid.x\nstore r2, 0\n", (4, 1, 1, 2, 1, 1)), [0, 1, 0, 1, 0, 1, 0, 1])
+    self.assertEqual(self.run_asm_dims("getsr r2, tpg.x\nstore r2, 0\n", (4, 1, 1, 2, 1, 1)), [2] * 8)
+    # 2D: out[tid.y * 2 + tid.x] = gid.y under 2x2 threadgroups of one thread, then lid.y under one group of 2x2
+    src = "getsr r2, tid.y\naddr r3, r2, 1, r1\ngetsr r4, %s\nstore r4, 0, r3\n"
+    self.assertEqual(self.run_asm_dims(src % "gid.y", (2, 2, 1, 1, 1, 1))[:4], [0, 0, 1, 1])
+    self.assertEqual(self.run_asm_dims(src % "lid.y", (1, 1, 1, 2, 2, 1))[:4], [0, 0, 1, 1])
+
+  def test_optimized_kernels(self): # the default optimizer: SPECIAL indices, threadgroups, upcasts; no NOOPT
+    A = [[float(i * 8 + j) for j in range(8)] for i in range(8)]; B = [[float((i * j) % 5) for j in range(8)] for i in range(8)]
+    a, b = Tensor(A).contiguous().realize(), Tensor(B).contiguous().realize()
+    self.assertEqual((a + b).tolist(), [[x + y for x, y in zip(ra, rb)] for ra, rb in zip(A, B)])
+    self.assertEqual((a @ b).tolist(), [[sum(A[i][k] * B[k][j] for k in range(8)) for j in range(8)] for i in range(8)])
+    self.assertEqual(a.sum(axis=1).tolist(), [sum(r) for r in A])
+    self.assertEqual(Tensor([float(i) for i in range(1000)]).contiguous().realize().sum().item(), sum(range(1000)))
+    # a fully unrolled reduce: 128 loads and their addresses are issued up front by tinygrad; lazy loads and deferred address math keep it in 64 registers
+    import random; random.seed(0)
+    for n in (32, 64):   # 64 uses a 16-element register-array accumulator (4x4 upcast)
+      A = [[random.random() for _ in range(n)] for _ in range(n)]; B = [[random.random() for _ in range(n)] for _ in range(n)]
+      got = (Tensor(A).contiguous().realize() @ Tensor(B).contiguous().realize()).tolist()
+      self.assertLess(max(abs(g - sum(A[i][k] * B[k][j] for k in range(n))) for i, row in enumerate(got) for j, g in enumerate(row)), 1e-3)
+
   def test_int_compare_select(self):
     for a, b, src, want in [(3, 5, "icmp.lt r4, r0, r2\nstore r4, 0\n", 1), (5, 3, "icmp.lt r4, r0, r2\nstore r4, 0\n", 0), (-1, 5, "icmp.lt r4, r0, r2\nstore r4, 0\n", 1),
                             (-1, 5, "icmp.ult r4, r0, r2\nstore r4, 0\n", 0), (3, 3, "icmp.eq r4, r0, r2\nstore r4, 0\n", 1),
@@ -211,7 +247,7 @@ class TestAGX(unittest.TestCase):
     for _ in range(40): x = x * b + a; want = [w * bb + aa for w, bb, aa in zip(want, B, A)]
     with Context(NOOPT=1): got, srcs = self.run_capturing(x)
     self.assertEqual(got, want)
-    self.assertLess(max(int(r) for r in re.findall(r"\br(\d+)", srcs[-1])), 10, srcs[-1])
+    self.assertLess(len(set(re.findall(r"\br(\d+)", srcs[-1]))), 10, srcs[-1])   # distinct registers, not the highest number
 
   def test_many_live_values(self): # 24 loads live at once, then a chain of fmas: registers into the twenties, all correct
     from tinygrad.helpers import Context

@@ -1,6 +1,5 @@
-# 4x4 matmul through hand-assembled Apple GPU machine code: three nested loops, indexed loads, one fma, one thread
-#   PYTHONPATH=. DEV=AGX NOOPT=1 python3 examples/agx/matmul.py          (add DEBUG=4 for the assembly, DEBUG=7 for the disassembly)
-# NOOPT=1: the renderer lowers the naive kernel only (no upcasts, no vector loads, no threads yet)
+# 4x4 matmul through hand-assembled Apple GPU machine code: threadgroup indices, loops, indexed loads, fma
+#   PYTHONPATH=. DEV=AGX python3 examples/agx/matmul.py          (add DEBUG=4 for the assembly, DEBUG=7 for the disassembly; NOOPT=1 for one thread)
 from tinygrad import Tensor, Device
 Device[Device.DEFAULT].wait_timeout_ms = 10000.0
 

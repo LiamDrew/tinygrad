@@ -121,6 +121,7 @@ class Scheduler:
             f"invalid split arg {opt.arg}")
       check(not top or new_type is AxisType.GROUP_REDUCE, "top is only for group reduce")
       if new_type in (AxisType.LOCAL, AxisType.GROUP_REDUCE): check(self.ren.has_local, "locals needed for opt")
+      if new_type == AxisType.GROUP_REDUCE: check(self.ren.has_shared, "shared memory needed for group reduce")
       check(rng.arg[-1] in split_targets[new_type], f"{new_type} is from {split_targets[new_type]}, not {rng.arg[-1]}")
 
       if amt == 0: amt = int(rng.vmax+1)

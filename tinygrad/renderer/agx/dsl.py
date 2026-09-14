@@ -113,8 +113,8 @@ LOOP_INIT = Inst("loop_init", bytes.fromhex("0b0020c0"), (Field("dst", B(0, 4), 
 LOOP_INC = Inst("loop_inc", bytes.fromhex("9f01040003000088 1504".replace(" ", "")), (
   Field("dst", B(3, 1), 7), Field("step", B(5, 1), 7), Field("src", B(6, 3), 5)),   # src: counter register << 3 (r3 -> 18, r6 -> 30)
   doc="counter = counter + step")
-LOOP_CMP = Inst("loop_cmp", bytes.fromhex("0a002380"), (Field("depth2", B(0, 4), 4), Field("src", B(1), 8), Field("n", B(3, 1), 6)),
-  doc="compare counter with n (even). src: (reg<<1)|1; bit0 of byte3 ignored; depth2 = 2 * loop nesting depth (probes/mm_shape.metal)")
+LOOP_CMP = Inst("loop_cmp", bytes.fromhex("0a002380"), (Field("depth2", B(0, 4), 4), Field("src", B(1), 8), Field("n_hi", B(2, 4), 1), Field("n", B(3, 1), 6)),
+  doc="compare counter with n (even, n/2 in 7 bits: n low 6 + n_hi; probes/loop250.metal). src: (reg<<1)|1; depth2 = 2 * nesting depth. Apple holds counts above 254 in a register")
 LOOP_ENTER = Inst("loop_enter", bytes.fromhex("07020000"), (Field("extra", B(0, 4), 1),), doc="loop control; extra = one more iteration")
 LOOP_TAIL = Inst("loop_tail", bytes.fromhex("8f045422"), (Field("depth4", B(3, 2), 6),), doc="loop control before the back branch; byte3 = 0x22 + 4 * nesting depth")
 BRANCH = Inst("branch", bytes.fromhex("0f00540000000000ff00"), (Field("off", B(3), 40),), doc="pc += off (relative to this instruction's address); 10 bytes")
@@ -253,7 +253,11 @@ MOVIMM = Inst("movimm", bytes.fromhex("0c80020000000000"), (
 _MOVIMM_SLICES = (("v0_6", 0, 7), ("v7_8", 7, 2), ("v9_10", 9, 2), ("v11_12", 11, 2), ("v13_20", 13, 8), ("v21_24", 21, 4), ("v25_31", 25, 7))
 NOP = Inst("nop", bytes.fromhex("0600"))
 STOP = Inst("stop", bytes.fromhex("0e000000"))
-GET_TID = Inst("get_tid", bytes.fromhex("1ca01006"), doc="read thread_position_in_grid (prologue)")
+# special registers (probes/sr/*.metal; hardware-verified under multi-threadgroup dispatches, 32-bit reads of the 16-bit ones work): byte 1 = register
+SR = {"tid.x": 0xa0, "tid.y": 0xa1, "tid.z": 0xa2, "gid.x": 0x9c, "gid.y": 0x9d, "gid.z": 0x9e, "lid.x": 0xa4, "lid.y": 0xa5, "lid.z": 0xa6,
+      "tpg.x": 0x98, "tpg.y": 0x99, "tpg.z": 0x9a}   # thread_position_in_grid, threadgroup_position_in_grid, thread_position_in_threadgroup, threads_per_threadgroup
+GET_SR = Inst("getsr", bytes.fromhex("0c001006"), (Field("dst", B(0, 4), 4), Field("sr", B(1), 8)), doc="dst = special register (dst nibble only: r0..r15)")
+GET_TID = GET_SR # old name; the prologue reads tid.x into r1
 STORE_WAIT = Inst("store_wait", bytes.fromhex("110000901100"),
   doc="wait for the preceding store. Apple emits one after every store; two stores back to back lose data without it (test_agx)")
 BARRIER = STORE_WAIT # old name
@@ -274,7 +278,7 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
   if inst is IMUL: return f"imul r{d['dst']}, #{d['stride']}"
   if inst is LOOP_INIT: return f"loop_init r{d['dst']}"
   if inst is LOOP_INC: return f"loop_inc r{d['dst']}, r{d['src']}, #{d['step']}"
-  if inst is LOOP_CMP: return f"loop_cmp r{d['src'] >> 1}, #{d['n'] << 1}" + (f" ; depth {d['depth2'] >> 1}" if d["depth2"] else "")
+  if inst is LOOP_CMP: return f"loop_cmp r{d['src'] >> 1}, #{(d['n'] | d['n_hi'] << 6) << 1}" + (f" ; depth {d['depth2'] >> 1}" if d["depth2"] else "")
   if inst is LOOP_TAIL: return "loop_tail" + (f" ; depth {d['depth4'] - 8}" if d["depth4"] != 8 else "")
   if inst is LOOP_ENTER: return "loop_enter" + (" ; extra" if d["extra"] else "")
   if inst is BRANCH: return f"branch {d['off'] - (1 << 40) if d['off'] >> 39 else d['off']:+d}"
@@ -289,6 +293,7 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
     c = f"#{'-' if d['c_hi'] else ''}{e4m3_value(d['c'] | 1):g}" if d["c_imm"] else f"{'-' if d['c_neg'] else ''}r{d['c'] >> 1}"
     return f"fma r{dst_reg(d)}, {'-' if d['negp'] else ''}{a}, r{operand_reg(d['srcb'])}, {c}" + "".join(f" ; {n}" for n in ("killa", "killb", "fwd") if d[n])
   if inst is MOVIMM: return f"movimm r{dst_reg(d)}, #{movimm_value(d):g}"
+  if inst is GET_SR: return f"getsr r{d['dst']}, " + next((n for n, v in SR.items() if v == d["sr"]), f"#0x{d['sr']:02x}")
   if inst in CVTS.values(): return f"{inst.mnemonic} r{d['dst']}, r{d['a']}" + (" ; killa" if d["killa"] else "")
   if inst in SHIFTS.values(): return f"{inst.mnemonic} r{d['dst']}, r{d['a']}, " + (f"r{d['breg']}" if "breg" in d else f"#{d['n']}") + "".join(f" ; {n}" for n in ("killa", "killb") if d.get(n))
   if inst is IADD: return f"iadd r{d['dst']}, r{d['a']}, r{d['breg']}"

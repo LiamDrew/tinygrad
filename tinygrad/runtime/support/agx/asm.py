@@ -21,7 +21,8 @@ def i_imul(dst, stride): return dsl.IMUL.encode(dst=dst, stride=stride)
 def i_wait(): return dsl.WAIT.encode()
 def loop_head(c, n, depth): # init and the increment/compare/enter block. between them the assembler puts the `pre` section (counter = 0..n-1)
     assert n >= 2, "loop counts below 2 hang the GPU"
-    inc = dsl.LOOP_INC.encode(dst=c, step=1, src=c) + dsl.LOOP_CMP.encode(depth2=2 * depth, src=dsl.reg_operand(c), n=n >> 1) + dsl.NOP.encode() + dsl.LOOP_ENTER.encode(extra=n & 1)
+    assert n <= 255, f"loop counts above 255 need a register-held count (not implemented), got {n}"
+    inc = dsl.LOOP_INC.encode(dst=c, step=1, src=c) + dsl.LOOP_CMP.encode(depth2=2 * depth, src=dsl.reg_operand(c), n=(n >> 1) & 0x3f, n_hi=n >> 7) + dsl.NOP.encode() + dsl.LOOP_ENTER.encode(extra=n & 1)
     return dsl.LOOP_INIT.encode(dst=c), inc
 def loop_tail(back, depth): # back: bytes from the increment to here
     return dsl.LOOP_TAIL.encode(depth4=8 + depth) + dsl.BRANCH.encode(off=(-(back + dsl.LOOP_TAIL.size)) & 0xffffffffff) + dsl.LOOP_EXIT.encode()
@@ -50,7 +51,7 @@ EPILOGUE     = dsl.STOP.encode() # the last store's wait precedes it
 def assemble_text(program):
     """Return (text_bytes, N, written slots). Builds preamble(0..0x40) + main + epilogue."""
     N=0; main=bytearray(); load_i=0; written=set(); seen_mem=False; pending=False; loops=[] # pending: loads issued, nothing waited yet
-    main+=dsl.GET_TID.encode()                            # thread-index prologue
+    main+=dsl.GET_SR.encode(dst=1, sr=dsl.SR["tid.x"])   # thread-index prologue: r1 = thread_position_in_grid.x
     lines=[l.split(';')[0].strip() for l in program.splitlines()]  # ';' comments only ('#'=imm)
     lines=[l for l in lines if l]
     body=[]
@@ -75,6 +76,8 @@ def assemble_text(program):
             main+=i_imul(reg(p[1]), int(p[2].lstrip('#')))
         elif op=='imul':                                 # imul rD, rA, rB : rD = rA * rB
             main+=dsl.IMUL_RR.encode(dst=reg(p[1]), a=reg(p[2]), breg=reg(p[3])); pending=False
+        elif op=='getsr':                                # getsr rD, gid.x | lid.y | tid.z | tpg.x ... (dsl.SR)
+            main+=dsl.GET_SR.encode(dst=reg(p[1]), sr=dsl.SR[p[2]])
         elif op in dsl.CVTS:                             # i2f|u2f|f2i|f2u rD, rA
             main+=dsl.CVTS[op].encode(dst=reg(p[1]), a=reg(p[2])); pending=False
         elif op in ('ishl','ishr','ushr'):               # ishl|ishr|ushr rD, rA, #n | rB : shift left / arithmetic right / logical right
