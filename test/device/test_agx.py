@@ -29,7 +29,7 @@ class TestAGXISA(unittest.TestCase): # no device needed: the table must read bac
     text, _, _ = asm.assemble_text("movimm r0, #42.0\nfadd r0, r0, #-3.5\nstore r0, 0\n")
     body = [t for _, _, t in dsl.disassemble(text)]
     self.assertIn("movimm r0, #42", body)
-    self.assertIn("fadd r0, r0, #-3.5 ; killa ; killb", body)
+    self.assertIn("fadd r0, r0, #-3.5 ; killa ; killb ; tag 20", body) # no loads pending: not a waiting op
 
 @unittest.skipUnless(Device.DEFAULT == "AGX", "AGX device required")
 class TestAGX(unittest.TestCase):
@@ -59,6 +59,14 @@ class TestAGX(unittest.TestCase):
 
   def test_odd_registers(self): # loads and operands numbered in 32-bit registers, odd ones included
     self.assertEqual(self.run_asm(".buffers 3\nload r1, 1\nwait\nload r3, 2\nwait\nfmul r5, r1, r3\nstore r5, 0\n", 1.5, 2.25), 3.375)
+
+  def test_load_wait_model(self): # dsl.LOAD_WAIT_MODEL
+    # copy: the store is the first consumer and must wait
+    self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nstore r0, 0\n", 1.5, 2.25), 1.5)
+    # first op waits (six-byte, tail c0), the next two are four-byte: (1.5 + 1) + 2.25, squared
+    self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nfadd r0, r0, #1.0\nfadd r0, r0, r2\nfmul r0, r0, r0\nstore r0, 0\n", 1.5, 2.25), 22.5625)
+    # one waiting op on r0 covers r2 too: store r2 plainly afterwards
+    self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nfadd r4, r0, #1.0\nstore r2, 0\n", 1.5, 2.25), 2.25)
 
   def test_operand_order(self): # subtraction would tell a from b; with add/mul only, check srca and srcb both read the right registers
     self.assertEqual(self.run_asm(".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nfadd r4, r2, r0\nstore r4, 0\n", 1.5, 2.25), 3.75)

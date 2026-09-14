@@ -9,12 +9,13 @@ def reg(tok):
     assert tok[0]=='r'; return int(tok[1:])
 def i_load(dstreg, slot, first, more_follow): return dsl.LOAD.encode(first=int(first), more=int(more_follow), dst=dstreg, slot=slot)
 def i_wait(): return dsl.WAIT.encode()
-def i_falu_imm(dst,a,imm,mul=0): # six-byte form: byte4 bit7 marks the immediate, byte5 = c0 as in Apple's first ALU op
+def i_falu_imm(dst,a,imm,mul=0,wait=True): # an immediate needs the six-byte form (byte4 bit7); tail c0 only when waiting for loads
     b,neg=dsl.e4m3(imm)
-    return dsl.FALU_LONG.encode(dst=dst, srcb=b, mul=mul, killb=int(neg), killa=1, srca=dsl.reg_operand(a), ext=0x80, tag=0xc0)
-def i_falu_reg(dst,a,bb,mul=0): # six-byte form as in Apple's sum3 (mod 1c, tag c0): the four-byte form yields 0 on hardware when stored directly
-    return dsl.FALU_LONG.encode(dst=dst, srcb=dsl.reg_operand(bb), mul=mul, killa=1, killb=1, srca=dsl.reg_operand(a), tag=0xc0)
-def i_store(srcreg, slot, first=False): return dsl.STORE.encode(first=int(first), src=srcreg, slot=slot)
+    return dsl.FALU_LONG.encode(dst=dst, srcb=b, mul=mul, killb=int(neg), killa=1, srca=dsl.reg_operand(a), ext=0x80, tag=0xc0 if wait else 0x20)
+def i_falu_reg(dst,a,bb,mul=0,wait=True): # waiting (six-byte, tail c0) for the first consumer of loads, else the four-byte form, like Apple
+    if wait: return dsl.FALU_LONG.encode(dst=dst, srcb=dsl.reg_operand(bb), mul=mul, killa=1, killb=1, srca=dsl.reg_operand(a), tag=0xc0)
+    return dsl.FALU.encode(dst=dst, srcb=dsl.reg_operand(bb), mul=mul, killa=1, killb=1, srca=dsl.reg_operand(a))
+def i_store(srcreg, slot, first=False, wait=False): return dsl.STORE.encode(first=int(first), wait=int(wait), src=srcreg, slot=slot)
 def movimm_bytes(dst, f): return dsl.MOVIMM.encode(dst=dst, **dsl.movimm_fields(f))
 
 PREAMBLE_IDX = bytes.fromhex('030007000200000060000e000000')  # thread-index preamble
@@ -22,7 +23,7 @@ EPILOGUE     = dsl.BARRIER.encode() + dsl.STOP.encode()
 
 def assemble_text(program):
     """Return (text_bytes, N, written slots). Builds preamble(0..0x40) + main + epilogue."""
-    N=0; main=bytearray(); load_i=0; written=set(); seen_mem=False
+    N=0; main=bytearray(); load_i=0; written=set(); seen_mem=False; pending=False # pending: loads issued, nothing waited yet
     main+=dsl.GET_TID.encode()                            # thread-index prologue
     lines=[l.split(';')[0].strip() for l in program.splitlines()]  # ';' comments only ('#'=imm)
     lines=[l for l in lines if l]
@@ -37,20 +38,21 @@ def assemble_text(program):
         op=p[0]
         if op=='load':
             d=reg(p[1]); slot=int(p[2]); N=max(N,slot+1)
-            main+=i_load(d,slot, load_i==0, load_i<total_loads-1); load_i+=1; seen_mem=True
+            main+=i_load(d,slot, load_i==0, load_i<total_loads-1); load_i+=1; seen_mem=True; pending=True
         elif op=='wait':
             main+=i_wait()
         elif op in ('fadd','fmul'):
             d=reg(p[1]); a=reg(p[2]); mul=int(op=='fmul')
             if p[3].startswith('#'):
-                main+=i_falu_imm(d,a,float(p[3][1:]),mul)
+                main+=i_falu_imm(d,a,float(p[3][1:]),mul,wait=pending)
             else:
-                main+=i_falu_reg(d,a,reg(p[3]),mul)
+                main+=i_falu_reg(d,a,reg(p[3]),mul,wait=pending)
+            pending=False
         elif op=='movimm':
             d=reg(p[1]); main+=movimm_bytes(d,float(p[2].lstrip('#')))
         elif op=='store':
             s=reg(p[1]); slot=int(p[2]); N=max(N,slot+1); written.add(slot)
-            main+=i_store(s,slot, first=not seen_mem); seen_mem=True
+            main+=i_store(s,slot, first=not seen_mem, wait=pending); seen_mem=True; pending=False
         else:
             raise ValueError(f"unknown op {op}")
     main+=EPILOGUE

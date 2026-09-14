@@ -71,13 +71,18 @@ LOAD = Inst("load", bytes.fromhex("6700440000012000"), (
   doc="dst = buf[slot][thread_index] (32-bit)")
 STORE = Inst("store", bytes.fromhex("e700540000012100"), (
   Field("first", B(1, 4), 1),       # set when no load preceded (probes/movimm.metal)
-  Field("hint", B(2, 1), 1),        # 0x56 vs 0x54 in byte 2: seen on stores straight from a load, meaning unknown; 0 works everywhere
+  Field("wait", B(2, 1), 1),        # wait for outstanding loads first (0x56). Required on the first consumer of load data, see LOAD_WAIT_MODEL
   Field("src", B(3, 1), 7),         # source register (reg_field)
   Field("slot", B(4), 8)),
   doc="buf[slot][thread_index] = src (32-bit)")
 WAIT = Inst("wait", bytes.fromhex("510100404600"), doc="wait for one outstanding load")
-# float ALU. 4-byte minimal form: [09 | dst<<4] [srcb] [mod] [srca]. mod bit2 adds two bytes (byte4 = 0 so far, byte5 in {c0,20,40}:
-# scheduling-looking, undecoded); mod bit1 adds an fma third operand. Verified on hardware in test_agx with explicit and odd dst.
+LOAD_WAIT_MODEL = """Loads are asynchronous and the synchronization is explicit, in the consumer (hardware-verified, test_agx):
+  1. every load is followed by WAIT (51 01 00 40 46 00); it must directly follow its load.
+  2. the first consumer of loaded data must be a waiting form: STORE with wait=1 (0x56) or the six-byte FALU_LONG with tail 00 c0.
+     Non-waiting consumers (four-byte FALU, STORE 0x54) read stale registers (zeros) if they come first.
+  3. one waiting consumer covers all outstanding loads: after it, four-byte FALU and 0x54 stores are fine (Apple emits exactly this).
+Apple's later six-byte ops carry tails 00 20 / 00 40; those do not work as the first consumer and are not understood."""
+# float ALU. 4-byte form: [09 | dst<<4] [srcb] [mod] [srca]. mod bit2 adds the two-byte tail (FALU_LONG); mod bit1 adds an fma third operand.
 FALU = Inst("falu", bytes.fromhex("09000000"), (
   Field("dst", B(0, 4), 4),         # destination register r0..r15 (probes/sums_live.metal)
   Field("srcb", B(1), 8),           # register operand, or E4M3 immediate when bmode has bit 7
@@ -87,9 +92,9 @@ FALU = Inst("falu", bytes.fromhex("09000000"), (
   Field("killa", B(2, 4), 1),       # srca dies after this op
   Field("fwd", B(2, 5), 1),         # result feeds another ALU op rather than a store
   Field("srca", B(3), 8)),
-  doc="fadd32/fmul32: dst = srca op srcb. Apple emits this short form, but on hardware a store right after it reads 0: use FALU_LONG")
+  doc="fadd32/fmul32: dst = srca op srcb. Non-waiting form: only valid after a waiting consumer (LOAD_WAIT_MODEL)")
 FALU_LONG = Inst("falu", bytes.fromhex("090004000000"), tuple(FALU.fields) + (Field("ext", B(4), 8), Field("tag", B(5), 8)),
-  doc="six-byte float ALU: mod bit2 (fixed here) set, byte4 = 0 or 0x80 for an immediate srcb, byte5 = c0/20/40 in Apple's output")
+  doc="six-byte float ALU: byte4 = 0, or 0x80 for an immediate srcb; tail byte 0xc0 = wait for outstanding loads (LOAD_WAIT_MODEL)")
 FALU_IMM_NEG, FALU_IMM_ADD = 1, 0    # for an E4M3 immediate srcb the sign lives in killb: 0x14 = add, 0x1c = negate (prog_add vs probes)
 MOVIMM = Inst("movimm", bytes.fromhex("0c80020000000000"), (
   Field("hi7", B(3, 1), 7),         # fp32 bits[31:25]
@@ -113,7 +118,7 @@ def movimm_value(d:dict[str, int]) -> float:
 # ---- disassembler -----------------------------------------------------------------------------------------------------------------
 def fmt(inst:Inst, d:dict[str, int]) -> str:
   if inst is LOAD: return f"load r{d['dst']}, {d['slot']}" + (" ; first" if d["first"] else "") + (" ; more" if d["more"] else "")
-  if inst is STORE: return f"store r{d['src']}, {d['slot']}" + (" ; first" if d["first"] else "") + (" ; hint" if d["hint"] else "")
+  if inst is STORE: return f"store r{d['src']}, {d['slot']}" + (" ; first" if d["first"] else "") + (" ; wait" if d["wait"] else "")
   if inst is FALU or inst is FALU_LONG:
     op, dst, a = "fmul" if d["mul"] else "fadd", f"r{d['dst']}", f"r{operand_reg(d['srca'])}"
     flags = "".join(f" ; {n}" for n in ("fma", "killa", "killb", "fwd") if d[n]) + (f" ; tag {d['tag']:02x}" if inst is FALU_LONG and d["tag"] != 0xc0 else "")
