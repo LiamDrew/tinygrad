@@ -90,14 +90,15 @@ def assemble_text(program):
             main+=dsl.ISUB.encode(dst=reg(p[1]), breg=reg(p[2]), a=reg(p[3])); pending=False
         elif op=='ineg':                                 # ineg rD, rA
             main+=dsl.INEG.encode(dst=reg(p[1]), a=reg(p[2])); pending=False
-        elif op in ('iand','ior','ixor','imax','imin'):  # op rD, rA, rB
-            inst={'iand':dsl.IAND,'ior':dsl.IOR,'ixor':dsl.IXOR,'imax':dsl.IMAX,'imin':dsl.IMIN}[op]
+        elif op in ('iand','ior','ixor','imax','imin','fmax','fmin'):  # op rD, rA, rB
+            inst={'iand':dsl.IAND,'ior':dsl.IOR,'ixor':dsl.IXOR,'imax':dsl.IMAX,'imin':dsl.IMIN,'fmax':dsl.FMAX,'fmin':dsl.FMIN}[op]
             main+=inst.encode(**dsl.dst_fields(reg(p[1])), srca=dsl.reg_operand(reg(p[2])), srcb=dsl.reg_operand(reg(p[3]))); pending=False
-        elif op=='isel':                                 # isel rD, rA, rB, rC [, rE] : rD = (rA < rB) ? rC : rE (rE defaults to rA)
-            kw=dict(**dsl.dst_fields(reg(p[1])), srcb=dsl.reg_operand(reg(p[2])), srca=dsl.reg_operand(reg(p[3])), c=reg(p[4]))
+        elif op in ('isel','fsel'):                      # isel|fsel rD, rA, rB, rC [, rE] : rD = (rA < rB) ? rC : rE (rE defaults to rA); int or float compare
+            kw=dict(**dsl.dst_fields(reg(p[1])), srcb=dsl.reg_operand(reg(p[2])), srca=dsl.reg_operand(reg(p[3])), c=reg(p[4]), code=dsl.SEL_CODES[op])
             main+=dsl.ISEL4.encode(**kw, e=reg(p[5]) if len(p)>5 else reg(p[2])); pending=False   # always the explicit-else form (ISEL's implicit else is not understood)
-        elif op.startswith('icmp.'):                     # icmp.lt|gt|ult|eq|ne rD, rA, rB : rD = (rA op rB) ? 1 : 0
-            main+=dsl.ICMP.encode(**dsl.dst_fields(reg(p[1])), srcb=dsl.reg_operand(reg(p[2])), srca=dsl.reg_operand(reg(p[3])), **dsl.cmp_fields(op[5:])); pending=False
+        elif op.startswith('icmp.') or op.startswith('fcmp.'):   # icmp.lt|gt|ult|eq|ne / fcmp.lt|gt|le|eq|ne rD, rA, rB : rD = (rA op rB) ? 1 : 0
+            code=op[5:] if op.startswith('icmp.') else 'f'+op[5:]
+            main+=dsl.ICMP.encode(**dsl.dst_fields(reg(p[1])), srcb=dsl.reg_operand(reg(p[2])), srca=dsl.reg_operand(reg(p[3])), **dsl.cmp_fields(code)); pending=False
         elif op=='loop':                                 # loop rC, #n [pre] body [post] endloop
             init, inc = loop_head(reg(p[1]), int(p[2].lstrip('#')), len(loops))  # pre: ALU-only, sees rC = 0..n-1 (Apple's layout); post: the rest, rC = 1..n
             main+=init; loops.append((len(main), inc)); pending=False # loop_init's tail waits for pending loads

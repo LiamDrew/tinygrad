@@ -197,6 +197,28 @@ class TestAGX(unittest.TestCase):
       got = (Tensor(A).contiguous().realize() @ Tensor(B).contiguous().realize()).tolist()
       self.assertLess(max(abs(g - sum(A[i][k] * B[k][j] for k in range(n))) for i, row in enumerate(got) for j, g in enumerate(row)), 1e-3)
 
+  def test_float_compare_select(self): # probes/fcmp: the compare instruction with float codes, fmax/fmin, and the float-compare select
+    k = ".buffers 3\nload r0, 1\nwait\nload r2, 2\nwait\nmovimm r5, #9.0\n%s\nstore r4, 0\n"
+    for a, b, body, want in [(1.5, 2.25, "fcmp.lt r4, r0, r2", 1.0), (2.25, 1.5, "fcmp.lt r4, r0, r2", 0.0), (2.25, 1.5, "fcmp.gt r4, r0, r2", 1.0), (1.5, 1.5, "fcmp.le r4, r0, r2", 1.0),
+                             (1.5, 1.5, "fcmp.eq r4, r0, r2", 1.0), (1.5, 2.25, "fcmp.ne r4, r0, r2", 1.0), (1.5, 1.5, "fcmp.ne r4, r0, r2", 0.0),
+                             (1.5, 2.25, "fmax r4, r0, r2", 2.25), (1.5, 2.25, "fmin r4, r0, r2\nfmin r6, r0, r2\nior r4, r6, r6", 1.5),
+                             (1.5, 2.25, "fsel r4, r0, r2, r5, r0", 9.0), (2.25, 1.5, "fsel r4, r0, r2, r5, r0", 2.25)]:
+      with self.subTest(a=a, b=b, body=body.split("\n")[0]):
+        got = self.run_asm(k % body, a, b)
+        # compares store an int 0/1 into a float buffer: read the bits back
+        self.assertEqual(struct.unpack("i", struct.pack("f", got))[0] if body.startswith("fcmp") else got, int(want) if body.startswith("fcmp") else want)
+
+  def test_float_compare_tensors(self):
+    from tinygrad import dtypes
+    from tinygrad.helpers import Context
+    A, B = [1.5, -2.0, 7.0, 0.0], [1.5, 3.0, -7.0, 1.0]
+    a, b = Tensor(A).contiguous().realize(), Tensor(B).contiguous().realize()
+    with Context(NOOPT=1):
+      for name, t, want in [("lt", (a < b).cast(dtypes.int32), [int(x < y) for x, y in zip(A, B)]), ("ne", (a != b).cast(dtypes.int32), [int(x != y) for x, y in zip(A, B)]),
+                            ("max", a.maximum(b), [max(x, y) for x, y in zip(A, B)]), ("where", (a < b).where(a, b), [x if x < y else y for x, y in zip(A, B)]),
+                            ("relu", a.relu(), [max(x, 0.0) for x in A]), ("where_f", (a < b).where(2.5, -1.0), [2.5 if x < y else -1.0 for x, y in zip(A, B)])]:
+        with self.subTest(op=name): self.assertEqual(t.tolist(), want)
+
   def test_int_compare_select(self):
     for a, b, src, want in [(3, 5, "icmp.lt r4, r0, r2\nstore r4, 0\n", 1), (5, 3, "icmp.lt r4, r0, r2\nstore r4, 0\n", 0), (-1, 5, "icmp.lt r4, r0, r2\nstore r4, 0\n", 1),
                             (-1, 5, "icmp.ult r4, r0, r2\nstore r4, 0\n", 0), (3, 3, "icmp.eq r4, r0, r2\nstore r4, 0\n", 1),

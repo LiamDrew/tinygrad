@@ -65,6 +65,9 @@ def e4m3_value(b:int) -> float:
   b >>= 1
   return 2.0 ** ((b >> 3) - 11) * (1 + (b & 7) / 8.0)
 
+DTYPES = """32-bit only, for now: float32, int32, uint32 and bool held as a 32-bit 0/1. float16/bfloat16 are NOT supported: Apple addresses 16-bit
+values as half registers (operand bit 0 clear, distinct opcodes like 09 c2 9b 06 for a half fadd, loads with byte 6 = 0x47) and none of that is
+decoded. 64-bit types need register pairs, also undecoded. The renderer asserts on any non-4-byte store or convert."""
 REGISTER_FILE = """128 32-bit registers, r0..r127 (hardware-verified 2026-09-14, M3):
   - the prologue leaves the thread index in r1; everything else is free.
   - float ALU destinations (FALU, FMA, MOVIMM) reach r63: nibble in byte 0 plus DST_HI in the mod byte. Apple's compiler never writes
@@ -220,16 +223,21 @@ IXOR = _BIT("ixor", "0b000600020800800000", "dst = srca ^ srcb")
 IMAX = Inst("imax", bytes.fromhex("020006000 6c0".replace(" ", "")), (Field("dst", B(0, 4), 4), Field("srcb", B(1), 8), Field("killb", B(2, 3), 1), Field("killa", B(2, 4), 1),
                                                                     DST_HI, Field("srca", B(3), 8)), doc="dst = max(srca, srcb), signed")
 IMIN = Inst("imin", bytes.fromhex("0200060007c0"), tuple(IMAX.fields), doc="dst = min(srca, srcb), signed")
+FMAX = Inst("fmax", bytes.fromhex("0200060000c0"), tuple(IMAX.fields), doc="dst = max(srca, srcb), float32 (probes/fcmp/fmax: byte 4 = 00)")
+FMIN = Inst("fmin", bytes.fromhex("0200060001c0"), tuple(IMAX.fields), doc="dst = min(srca, srcb), float32")
 # select: dst = (srcb < srca) ? c : srcb (8 bytes), or ? c : e with byte 4 bit 1 and two more bytes (10). Kills: c byte 4 bit 7, e byte 8 bit 7.
 # byte 4 bit 0 is required in the 8-byte form (cleared: wrong results); the 10-byte form has bit 1 instead
 ISEL = Inst("isel", bytes.fromhex("0200070001000 7c0".replace(" ", "")), (Field("dst", B(0, 4), 4), Field("srcb", B(1), 8), Field("killb", B(2, 3), 1), Field("killa", B(2, 4), 1),
   DST_HI, Field("srca", B(3), 8), Field("killc", B(4, 7), 1), Field("c", B(5, 1), 7)),
   doc="dst = srcb < srca ? c : (else). Apple's 8-byte form; with the kill bit off the false case read 0, so the assembler only emits ISEL4")
-ISEL4 = Inst("isel", bytes.fromhex("0200070002000 7c00000".replace(" ", "")), tuple(ISEL.fields) + (Field("kille", B(8, 7), 1), Field("e", B(9, 1), 7)),
-  doc="dst = srcb < srca ? c : e (signed)")
+ISEL4 = Inst("isel", bytes.fromhex("0200070002000 0c00000".replace(" ", "")), tuple(ISEL.fields) + (Field("code", B(6), 8), Field("kille", B(8, 7), 1), Field("e", B(9, 1), 7)),
+  doc="dst = srcb < srca ? c : e; code 07 = signed int compare, 03 = float compare (probes/fcmp/fwhere_c)")
+SEL_CODES = {"isel": 7, "fsel": 3}
 # compare: dst = srcb OP srca as 0/1. The 8-byte compare must be followed by the 6-byte 20 8x 13 00 00 01 (its nibble does nothing; without it the
 # register stays 0), so the table carries both as one 14-byte instruction. Codes (byte 4, byte 5 bit 0, byte 6, byte 9 bit 0):
-CMP_CODES = {"lt": (0x22, 1, 7, 0), "gt": (0x22, 1, 6, 0), "ult": (0x22, 1, 5, 0), "eq": (0x26, 1, 7, 0), "ne": (0x26, 0, 7, 1)}
+# float compares (probes/fcmp) are the same instruction with codes 03/02/00 instead of 07/06 (fle = 26 + 03); hardware-verified 2026-09-14
+CMP_CODES = {"lt": (0x22, 1, 7, 0), "gt": (0x22, 1, 6, 0), "ult": (0x22, 1, 5, 0), "eq": (0x26, 1, 7, 0), "ne": (0x26, 0, 7, 1),
+             "flt": (0x22, 1, 3, 0), "fgt": (0x22, 1, 2, 0), "fle": (0x26, 1, 3, 0), "feq": (0x26, 1, 0, 0), "fne": (0x26, 0, 0, 1)}
 ICMP = Inst("icmp", bytes.fromhex("020005000080 00c0 2080 13000001".replace(" ", "")), (Field("dst", B(0, 4), 4), Field("srcb", B(1), 8), Field("killb", B(2, 3), 1),
   Field("killa", B(2, 4), 1), DST_HI, Field("srca", B(3), 8), Field("k4", B(4), 8), Field("k5", B(5, 0), 1), Field("code", B(6), 8), Field("inv", B(9, 0), 1)),
   doc="dst = (srcb OP srca) ? 1 : 0; OP from CMP_CODES (lt gt eq ne signed, ult unsigned)")
@@ -262,7 +270,7 @@ STORE_WAIT = Inst("store_wait", bytes.fromhex("110000901100"),
   doc="wait for the preceding store. Apple emits one after every store; two stores back to back lose data without it (test_agx)")
 BARRIER = STORE_WAIT # old name
 
-TABLE = (LOAD, I2F, U2F, F2I, F2U, SHL_IMM, LSHR_IMM, ASHR_IMM, SHL_REG, LSHR_REG, ASHR_REG, IADD, ISUB, INEG, IMUL_RR, IAND, IOR, IXOR, IMAX, IMIN, ISEL4, ISEL, ICMP, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
+TABLE = (LOAD, FMAX, FMIN, I2F, U2F, F2I, F2U, SHL_IMM, LSHR_IMM, ASHR_IMM, SHL_REG, LSHR_REG, ASHR_REG, IADD, ISUB, INEG, IMUL_RR, IAND, IOR, IXOR, IMAX, IMIN, ISEL4, ISEL, ICMP, IMUL, LOOP_INC, ADDR, LOOP_INIT, LOOP_CMP, LOOP_ENTER, LOOP_TAIL, BRANCH, LOOP_EXIT, STORE, WAIT, FMA, FALU_LONG, FALU, MOVIMM, GET_TID, STORE_WAIT, STOP, NOP)
 
 def movimm_bits_fields(v:int) -> dict[str, int]: return {n: (v >> lo) & ((1 << w) - 1) for n, lo, w in _MOVIMM_SLICES}
 def movimm_fields(f:float) -> dict[str, int]: return movimm_bits_fields(struct.unpack("<I", struct.pack("<f", f))[0])
@@ -300,12 +308,13 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
   if inst is ISUB: return f"isub r{d['dst']}, r{d['breg']}, r{d['a']}"
   if inst is INEG: return f"ineg r{d['dst']}, r{d['a']}"
   if inst is IMUL_RR: return f"imul r{d['dst']}, r{d['a']}, r{d['breg']}"
-  if inst in (IAND, IOR, IXOR, IMAX, IMIN):
+  if inst in (IAND, IOR, IXOR, IMAX, IMIN, FMAX, FMIN):
     return f"{inst.mnemonic} r{dst_reg(d)}, r{operand_reg(d['srca'])}, r{operand_reg(d['srcb'])}" + "".join(f" ; {n}" for n in ("killa", "killb") if d[n])
   if inst is ISEL or inst is ISEL4:
     e = f"r{d['e']}" if inst is ISEL4 else f"r{operand_reg(d['srcb'])}"
-    return f"isel r{dst_reg(d)}, r{operand_reg(d['srcb'])}, r{operand_reg(d['srca'])}, r{d['c']}, {e}" + "".join(f" ; {n}" for n in ("killa", "killb", "killc", "kille") if d.get(n))
-  if inst is ICMP: return f"icmp.{cmp_name(d)} r{dst_reg(d)}, r{operand_reg(d['srcb'])}, r{operand_reg(d['srca'])}" + "".join(f" ; {n}" for n in ("killa", "killb") if d[n])
+    mn = next((n for n, v in SEL_CODES.items() if v == d.get("code", 7)), "isel")
+    return f"{mn} r{dst_reg(d)}, r{operand_reg(d['srcb'])}, r{operand_reg(d['srca'])}, r{d['c']}, {e}" + "".join(f" ; {n}" for n in ("killa", "killb", "killc", "kille") if d.get(n))
+  if inst is ICMP: return f"{'fcmp' if cmp_name(d).startswith('f') else 'icmp'}.{cmp_name(d).lstrip('f') if cmp_name(d).startswith('f') else cmp_name(d)} r{dst_reg(d)}, r{operand_reg(d['srcb'])}, r{operand_reg(d['srca'])}" + "".join(f" ; {n}" for n in ("killa", "killb") if d[n])
   return inst.mnemonic
 
 def disassemble(code:bytes, entry:int=0x40) -> list[tuple[int, bytes, str]]:

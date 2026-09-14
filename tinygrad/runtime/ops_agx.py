@@ -61,8 +61,8 @@ class AGXRenderer(Renderer):
         for s in u.src:
           if s.op is Ops.MUL and s.dtype == dtypes.float and uses.get(s) == [u]: fused[s] = u; break   # one product per add
       # an int compare whose only use is a WHERE folds into the select (isel compares and selects in one op)
-      if u.op is Ops.WHERE and (c:=strip(u.src[0])).op is Ops.CMPLT and c.src[0].dtype in dtypes.ints and uses.get(c) == [u.src[0]] and (u.src[0] is c or uses.get(u.src[0]) == [u]):
-        fused[c] = u
+      if u.op is Ops.WHERE and (c:=strip(u.src[0])).op is Ops.CMPLT and uses.get(c) == [u.src[0]] and (u.src[0] is c or uses.get(u.src[0]) == [u]):
+        fused[c] = u   # int or float compare
 
     # lazy loads: a global LOAD whose first use is in the same straight-line region (no store, loop edge, branch or barrier in between) is emitted
     # right before that use. tinygrad issues every load of an unrolled reduce first; lowering them in place needs a register per load.
@@ -197,7 +197,7 @@ class AGXRenderer(Renderer):
           if cval(v) is not None: lines.append(f"movimm r{ra}, #{float(cval(v)) if dtypes.is_float(v.dtype) else '0x%08x' % (int(cval(v)) & 0xffffffff)}")
           elif (rv:=val(v)) != ra: lines.append(f"ior r{ra}, r{rv}, r{rv}")   # register move (bitwise, any 32-bit type)
         else:
-          assert v.dtype.itemsize == 4, f"only 32-bit stores for now, not {v.dtype}"
+          assert v.dtype.itemsize == 4, f"only 32-bit stores for now, not {v.dtype} (float16/bfloat16 are not supported: dsl.DTYPES)"
           lines.append(f"store r{val(v)}, {slot[strip(ix.src[0])]}, r{idxreg(ix.src[1])}")
       elif u.op in {Ops.ADD, Ops.MUL} and u.dtype == dtypes.float:
         us = uses.get(u, [])
@@ -214,11 +214,15 @@ class AGXRenderer(Renderer):
         ra, rb = val(u.src[0]), val(u.src[1])
         mn = "icmp.ult" if u.op is Ops.CMPLT and u.src[0].dtype in dtypes.uints else INT2[u.op]
         d = alloc_int(u); reg[u] = d; lines.append(f"{mn} r{d}, r{ra}, r{rb}")
+      elif u.op in {Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ, Ops.MAX} and u.src[0].dtype == dtypes.float:   # float compares (0/1 int result) and max
+        ra, rb = val(u.src[0]), val(u.src[1])
+        mn = {Ops.CMPLT: "fcmp.lt", Ops.CMPNE: "fcmp.ne", Ops.CMPEQ: "fcmp.eq", Ops.MAX: "fmax"}[u.op]
+        d = alloc(u) if u.op is Ops.MAX else alloc_int(u); reg[u] = d; lines.append(f"{mn} r{d}, r{ra}, r{rb}")
       elif u.op is Ops.SPECIAL:                                 # ("g"|"l", axis): threadgroup_position_in_grid / thread_position_in_threadgroup
         d = alloc_low(u); reg[u] = d; lines.append(f"getsr r{d}, {'gid' if u.arg[0] == 'g' else 'lid'}.{'xyz'[int(u.arg[-1])]}")
       elif u.op is Ops.CAST:                                    # int <-> float convert (a constant source is folded by tinygrad; else it is in a register)
         src = u.src[0]
-        assert u.dtype.itemsize == 4 and src.dtype.itemsize == 4 or src.dtype == dtypes.bool, f"only 32-bit converts for now: {src.dtype} -> {u.dtype}"
+        assert u.dtype.itemsize == 4 and src.dtype.itemsize == 4 or src.dtype == dtypes.bool, f"only 32-bit converts for now: {src.dtype} -> {u.dtype} (float16 is not supported: dsl.DTYPES)"
         mn = ("u2f" if src.dtype in dtypes.uints else "i2f") if dtypes.is_float(u.dtype) else ("f2u" if u.dtype in dtypes.uints else "f2i")
         ra = val(src); d = alloc_int(u) if is_int(u) else alloc(u); reg[u] = d; lines.append(f"{mn} r{d}, r{ra}")
       elif u.op in {Ops.SHL, Ops.SHR} and is_int(u):
@@ -228,13 +232,14 @@ class AGXRenderer(Renderer):
         d = alloc_int(u); reg[u] = d; lines.append(f"{mn} r{d}, r{ra}, {cnt}")
       elif u.op is Ops.NEG and is_int(u):
         ra = val(u.src[0]); d = alloc_int(u); reg[u] = d; lines.append(f"ineg r{d}, r{ra}")
-      elif u.op is Ops.WHERE and is_int(u):
+      elif u.op is Ops.WHERE and u.dtype.itemsize == 4:         # select of 32-bit values (int or float alike: the select moves bits)
         c, x, y = u.src
-        if fused.get(strip(c)) is u: ra, rb = val(strip(c).src[0]), val(strip(c).src[1])       # (a < b) ? x : y
+        mn = "isel"
+        if fused.get(cc:=strip(c)) is u: ra, rb = val(cc.src[0]), val(cc.src[1]); mn = "fsel" if cc.src[0].dtype == dtypes.float else "isel"   # (a < b) ? x : y
         else: ra, rb = None, val(c)                                                              # (0 < cond) ? x : y, zero register below
         rx, ry = val(x), val(y)
         if ra is None: ra = alloc_int(u); lines.append(f"movimm r{ra}, #0x00000000")
-        d = alloc_int(u); reg[u] = d; lines.append(f"isel r{d}, r{ra}, r{rb}, r{rx}, r{ry}")
+        d = alloc_int(u) if is_int(u) else alloc(u); reg[u] = d; lines.append(f"{mn} r{d}, r{ra}, r{rb}, r{rx}, r{ry}")
       else: raise NotImplementedError(f"AGX renderer: {u.op} {u.dtype}")
       expire(i); i += 1
     return "\n".join(lines) + "\n"
