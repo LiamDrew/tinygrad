@@ -41,6 +41,8 @@ ishl r10, r10, #4
 iadd r9, r9, r10
 iadd r9, r9, r6          ; B lane base: row * N + 16*gx + col
 iadd r11, r8, r10        ; C lane base: (16*gy + row) * N + 16*gx + col
+movimm r7, #0x{8 * N:08x}
+iadd r7, r8, r7          ; A rows 8..15 base
 movimm r32, #0.0
 movimm r33, #0.0
 movimm r34, #0.0
@@ -49,10 +51,11 @@ movimm r36, #0.0
 movimm r37, #0.0
 movimm r38, #0.0
 movimm r39, #0.0
-loop r14, #{N // 8}
+movimm r30, #0x{N // 8:08x}
+loop r14, r30              ; counts above 255 must live in a register
 body
 load2 r40, 1, r8
-load2 r42, 1, r8, #{8 * N}
+load2 r42, 1, r7
 load2 r44, 2, r9
 load2 r46, 2, r9, #8
 mma r32, r40, r44, r32
@@ -60,6 +63,7 @@ mma r34, r40, r46, r34
 mma r36, r42, r44, r36
 mma r38, r42, r46, r38
 iadd r8, r8, r13         ; A: next 8 columns
+iadd r7, r7, r13
 iadd r9, r9, r12         ; B: next 8 rows
 endloop
 store2 r32, 0, r11
@@ -72,6 +76,6 @@ for c in (codegen.to_program_cache, hcq2.hcq_compile_cache, hcq2.link_linear_cac
 A, B = np.random.default_rng(0).random((N, N), dtype=np.float32), np.random.default_rng(1).random((N, N), dtype=np.float32)
 with patch.object(ops_agx.AGXRenderer, "render", lambda self, uops: SRC), patch.object(ops_metal.MetalQueue, "dims", staticmethod(lambda prg: (N // 16, N // 16, 1, 32, 1, 1))):
   x, y = Tensor(A.ravel()).contiguous().realize(), Tensor(B.ravel()).contiguous().realize()
-  for _ in range(3): out = (x + y).realize()
+  for _ in range(int(__import__("os").getenv("RUNS", "3"))): out = (x + y).realize()
   got = np.array(out.tolist(), np.float32).reshape(N, N)
 print("maxerr", np.abs(got - A @ B).max(), " rows 0..1 cols 0..3:", got[:2, :4], (A @ B)[:2, :4])

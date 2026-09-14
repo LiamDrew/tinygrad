@@ -169,7 +169,9 @@ STORE_IDX = STORE # old name
 # load 44 0d 00 c0 08 00 (4-wide: 5c 0d), store 44 02 00 30 02 00; the load's element offset sits like a device load's (s[t + 8] -> byte 10 = 04).
 # The barrier is the 6-byte 07 04 54 61 09 00 (present exactly when the source has threadgroup_barrier). The allocation size is metadata fn field 28
 # (bytes: s[64] -> 256, s[1024] -> 4096).
-# widths (probes/tg): 1-wide tail byte 8 = 44, 2-wide 64 (bit 5), 4-wide 5c (bits 3, 4); a wide store also clears byte 11's 0x30 (5c 02 00 00 02 00).
+# widths (probes/tg): 1-wide tail byte 8 = 44, 2-wide 64 (bit 5), 4-wide 5c (bits 3, 4). Store byte 11's 0x30 is the stride format: with it the index
+# and offset count elements (hardware-verified for tgstore4); Apple clears it on wide stores (5c 02 00 00 02 00), whose index then counts float4s.
+# tgload2/tgload4 always index elements (tail c0).
 TG_WIDTH = {1: (0, 0), 2: (0, 1), 4: (3, 0)}   # count -> (w4, w2)
 TG_LOAD = Inst("tgload", bytes.fromhex("6702540000000000 440d00c00800".replace(" ", "")), (
   Field("wait", B(2, 1), 1), Field("dst", B(3, 1), 7), Field("base", B(4), 8), Field("a", B(5, 2), 6), Field("killa", B(6, 7), 1),
@@ -178,7 +180,7 @@ TG_LOAD = Inst("tgload", bytes.fromhex("6702540000000000 440d00c00800".replace("
 TG_STORE = Inst("tgstore", bytes.fromhex("e702540000000000 440200000200".replace(" ", "")), (
   Field("wait", B(2, 1), 1), Field("src", B(3, 1), 7), Field("base", B(4), 8), Field("a", B(5, 2), 6), Field("killa", B(6, 7), 1),
   Field("w4", B(8, 3), 2), Field("w2", B(8, 5), 1), Field("off0", B(9, 5), 3), Field("off3", B(10), 8), Field("s30", B(11, 4), 2)),
-  doc="threadgroup[(a + off) * 4 ..] = src[..count]; offset laid out like a device store's (hardware-verified: +1, +2, +8); s30 = 3 on 1-wide stores")
+  doc="threadgroup[(a + off) * 4 ..] = src[..count]; offset laid out like a device store's (hardware-verified: +1, +2, +8); s30 = 3: element stride")
 TG_BARRIER = Inst("barrier", bytes.fromhex("070454610900"), doc="threadgroup_barrier(mem_threadgroup)")
 # simdgroup matrix multiply-accumulate (probes/simd, hardware-verified 2026-09-14 against numpy with moved registers and re-reads): D(8x8) = A * B [+ C],
 # one 12-byte instruction per 8x8x8 (a 16x16x16 product compiles to eight). Each of the 32 lanes holds two consecutive elements of one row in a

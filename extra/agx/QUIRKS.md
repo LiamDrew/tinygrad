@@ -57,6 +57,17 @@ Freezes and hangs are marked. Never emit an instruction whose fields you have no
   running Apple's binary through our dispatch and splicing our flatbuffer sub-structures into it one reference at a time (memory note
   `agx-metadata-bisect-method`).
 - Dispatch dims are (threadgroups x,y,z, threads x,y,z): 8 groups of 1 thread each have private threadgroup memory and look like a broken barrier.
+- Offset field widths: threadgroup loads 9 bits (511 elements), threadgroup and device stores 11 bits (verified to 1024), device loads 13 bits.
+  Fold anything larger into the index register.
+- Wide threadgroup stores: byte 11 bits 4,5 (0x30) are the stride format. Set, the index and offset count elements (what the assembler emits);
+  Apple clears them on its float4 stores, whose index then counts float4s (thread 1's float4 landed at element 16); with them clear the staged
+  matmul is wrong (maxerr 152). tgload2/tgload4 always count elements.
+
+## Measuring
+- Never time two kernels concurrently: a 32-tile matmul measured 3646 us while another process used the GPU and 796 us alone.
+- The GPU clock is bimodal under Python-paced dispatch: the same correct kernel measured min 84 us / median 335 us over 30 runs (stock Metal's
+  512 matmul: min 116 / median 337). Compare kernels by the minimum over many runs, or use problems large enough (>= 1 ms) that one kernel
+  ramps the clock itself. Single-run numbers earlier in the log (264, 123, 283 us) are not comparable with each other.
 
 ## Transcendentals
 - rcp, rsqrt, rsqrt_special, exp2, log2 are single 10-byte ops in the convert layout (af/2f + function byte). rsqrt(0) = inf; rsqrt_special(0) = 1 so
@@ -67,9 +78,20 @@ Freezes and hangs are marked. Never emit an instruction whose fields you have no
 - One 12-byte instruction per 8x8x8 fp32 product (a 16x16x16 compiles to eight). Three register encodings in ONE instruction: D = register number,
   A/B = register << 1, C = register with adjacent bit pairs swapped (r4 -> 08, r6 -> 09, r8 -> 04, r20 -> 28). byte 11 bit 0 = accumulate.
 - Lane layout: lane t holds row ((t>>1)&3) + 4*(t>>4), columns 2*(t&1) + 4*((t>>3)&1) as a register pair. Same as tinygrad's `tc.metal` swizzle.
-- A hand-written 16x16-tile kernel (extra/agx/mm_hand.py) does 512^3 in 264 us, identical to Apple's compiler on the same structure (264.5 us);
-  stock tinygrad on Metal: 341 us. 32x32 tiles, 8x8 tiles and double-buffered fragments were all slower: memory/latency bound. Next lever:
-  stage tiles through threadgroup memory (tgstore4 / tgload2 are decoded and verified).
+- Hand-written kernels live in `extra/agx/mm_hand.py` (16x16 tile per SIMD group, no staging), `mm_staged.py` (32x32 tile per threadgroup of
+  4 SIMD groups, A 32x16 / B 16x32 staged through threadgroup memory) and `mm_staged64.py` (64x64 tile, 16 accumulator pairs per thread).
+- Timings, minimum over 20 runs of one process at a time (fp32, us):
+
+  | N    | mm_hand | mm_staged | mm_staged64 | stock tinygrad on Metal |
+  |------|---------|-----------|-------------|-------------------------|
+  | 1024 | 491     | 2119      | 476         | 431                     |
+  | 2048 | 4463    | -         | 4103        | 3154                    |
+
+  Metal's own kernel is still 10-30% ahead. Accumulators per thread dominate: the 64x64 tile (32 accumulator registers) beats the 32x32 tile
+  (8 registers) by 4x, and staging only pays once the tile is large enough to reuse what was staged. An earlier reading that a hand kernel
+  matched Apple's compiler and beat Metal came from single 512 runs and did not survive the measurement protocol below.
+- Switching a loop from an immediate count to a register count (same iteration count) took the 1024 unstaged kernel from 624 to 491 us,
+  reproducibly. Unexplained; possibly the immediate form's `extra` bit path.
 
 ## Method (what actually worked)
 - One field per probe, pairwise diffs against a known kernel, then a minimal GPU kernel with a double read.

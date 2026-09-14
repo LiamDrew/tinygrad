@@ -431,12 +431,14 @@ class TestAGX(unittest.TestCase):
     np.testing.assert_array_equal(a.sum(axis=1).numpy(), A.sum(axis=1))
 
   def test_threadgroup_memory(self): # probes/tg: tgstore/tgload/barrier with the metadata allocation; one group of 8 threads, x[i] = 2^i
-    k = ".buffers 3\n.tgmem 256\nload r0, 1\n%s\nstore r4, 0\n"
+    k = ".buffers 3\n.tgmem 4096\nload r0, 1\n%s\nstore r4, 0\n"   # 1024 floats: the offset cases index past the first 64
     for body, want in [("tgstore r0, r1\nbarrier\ntgload r4, r1", [2.0 ** t for t in range(8)]),
                        ("movimm r3, #0x00000001\nixor r2, r1, r3\ntgstore r0, r1\nbarrier\ntgload r4, r2", [2.0 ** (t ^ 1) for t in range(8)]),   # a neighbour's slot
                        ("tgstore r0, r1\nbarrier\ntgload r4, r1, #2", [2.0 ** (t + 2) for t in range(6)]),                                        # load offset
                        ("tgstore r0, r1, #8\nbarrier\ntgload r4, r1, #8", [2.0 ** t for t in range(8)]),                                          # store offset
-                       ("tgstore r0, r1\nbarrier\ntgload4 r4, r1\nfadd r4, r4, r5\nfadd r4, r4, r6\nfadd r4, r4, r7", [15.0 * 2 ** t for t in range(5)])]:   # 4-wide
+                       ("tgstore r0, r1\nbarrier\ntgload4 r4, r1\nfadd r4, r4, r5\nfadd r4, r4, r6\nfadd r4, r4, r7", [15.0 * 2 ** t for t in range(5)]),   # 4-wide
+                       ("addr r2, r1, 2, #0\nload4 r4, 1, r2\ntgstore4 r4, r2\nbarrier\ntgload2 r4, r2, #2\nior r4, r5, r5", [2.0 ** (4 * t + 3) for t in range(8)]),   # 4-wide store, 2-wide load, element units
+                       ("addr r2, r1, 2, #0\nload4 r4, 1, r2\ntgstore4 r4, r2, #256\nbarrier\nmovimm r8, #0x00000100\niadd r3, r2, r8\ntgload r4, r3, #1", [2.0 ** (4 * t + 1) for t in range(8)])]:   # 11-bit store offset
       with self.subTest(body=body.split("\n")[-1]): self.assertEqual(self.run_asm8v(k % body, group=True)[:len(want)], want)
 
   def test_group_reduce_tensors(self): # the optimizer's GROUP_REDUCE kernels: threadgroup buffer, barrier, second-stage loop, IF-guarded store

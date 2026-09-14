@@ -126,7 +126,7 @@ def assemble_text(program):
             off = int(p[3].lstrip('#')) if len(p) > 3 else 0; n = int(op[-1]) if op[-1].isdigit() else 1
             assert N and TGMEM[0], "threadgroup ops need .buffers and .tgmem first"
             w4, w2 = dsl.TG_WIDTH[n]
-            kw = dict(base=2 * tg_base_words(N), a=reg(p[2]), w4=w4, w2=w2, wait=int(pending), **(dict(off0=off & 1, off1=off >> 1) if inst is dsl.TG_LOAD else dict(s30=3 if n == 1 else 0, **dsl.store_off_fields(off))))   # base: uniform register (16-bit units) holding the tg pointer
+            kw = dict(base=2 * tg_base_words(N), a=reg(p[2]), w4=w4, w2=w2, wait=int(pending), **(dict(off0=off & 1, off1=off >> 1) if inst is dsl.TG_LOAD else dict(s30=3, **dsl.store_off_fields(off))))   # base: uniform register (16-bit units) holding the tg pointer
             main += inst.encode(dst=reg(p[1]), **kw) if inst is dsl.TG_LOAD else inst.encode(src=reg(p[1]), **kw)
             for k in range(1, n): reg(f"r{reg(p[1])+k}")
             pending = inst is dsl.TG_LOAD; seen_mem = True
