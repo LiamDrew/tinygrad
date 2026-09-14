@@ -5,6 +5,7 @@ from tinygrad.helpers import Target
 from tinygrad.device import Compiler
 from tinygrad.renderer import Renderer
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher
+from tinygrad.dtype import dtypes
 from tinygrad.runtime.autogen import metal
 import tinygrad.runtime.support.objc as objc
 from tinygrad.runtime.ops_metal import MetalDevice, MetalQueue, checked, to_ns_str
@@ -12,16 +13,17 @@ from tinygrad.runtime.support.hcq2 import encode_submit
 from tinygrad.runtime.support.agx import asm
 from tinygrad.renderer.agx import dsl
 
-# step 1 stub: every kernel renders to the same three-buffer add, data0[t] = data1[t] + data2[t]
-ADD_ASM = """
+# step 2 stub: every kernel is one binary float op over three buffers, data0[t] = data1[t] op data2[t]; the op is read off the UOps
+BINOP_ASM = """
 .buffers 3
 load r0, 1
 wait
 load r1, 2
 wait
-fadd r2, r0, r1
+{op} r2, r0, r1
 store r2, 0
 """
+FLOAT_OPS = {Ops.ADD: "fadd", Ops.MUL: "fmul"}
 
 class AGXCompiler(Compiler):
   def __init__(self): super().__init__("compile_agx")
@@ -34,8 +36,9 @@ class AGXRenderer(Renderer):
   compiler = AGXCompiler()
   def render(self, uops:list[UOp]) -> str:
     params = [u for u in uops if u.op is Ops.PARAM]
-    assert len(params) == 3, f"the stub add kernel needs exactly 3 buffers, got {len(params)}"
-    return ADD_ASM
+    alus = [u for u in uops if u.op in FLOAT_OPS and u.dtype == dtypes.float]
+    assert len(params) == 3 and len(alus) == 1, f"the stub renders one float add/mul over 3 buffers, got {len(params)} buffers, {[u.op for u in alus]}"
+    return BINOP_ASM.format(op=FLOAT_OPS[alus[0].op])
 
 # *****************
 # in-memory binary archive: Metal's archive loading is path-only, so we hook the lookup and insert our compute object under whatever key it asks

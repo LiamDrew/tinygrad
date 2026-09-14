@@ -9,10 +9,10 @@ def reg(tok):
     assert tok[0]=='r'; return int(tok[1:])
 def i_load(dstreg, slot, first, more_follow): return dsl.LOAD.encode(first=int(first), more=int(more_follow), dst=dstreg, slot=slot)
 def i_wait(): return dsl.WAIT.encode()
-def i_fadd_imm(dst,a,imm):
+def i_falu_imm(dst,a,imm,mul=0):
     b,neg=dsl.e4m3(imm)
-    return dsl.FADD.encode(srcb=b, mod=dsl.FADD_NEG if neg else dsl.FADD_ADD_IMM, srca=dsl.reg_operand(a), bmode=0x80)
-def i_fadd_reg(dst,a,bb): return dsl.FADD.encode(srcb=dsl.reg_operand(bb), mod=dsl.FADD_NEG, srca=dsl.reg_operand(a))
+    return dsl.FALU.encode(srcb=b, mul=mul, mod=(dsl.FADD_NEG if neg else dsl.FADD_ADD_IMM)>>1, srca=dsl.reg_operand(a), bmode=0x80)
+def i_falu_reg(dst,a,bb,mul=0): return dsl.FALU.encode(srcb=dsl.reg_operand(bb), mul=mul, mod=dsl.FADD_NEG>>1, srca=dsl.reg_operand(a))
 def i_store(srcreg, slot, is_result):
     src=dsl.STORE_RESULT if is_result else (0x56 if srcreg==0 else dsl.STORE_RESULT+srcreg*2)
     return dsl.STORE.encode(src=src, slot=slot)
@@ -42,12 +42,12 @@ def assemble_text(program):
             main+=i_load(d,slot, load_i==0, load_i<total_loads-1); load_i+=1
         elif op=='wait':
             main+=i_wait()
-        elif op=='fadd':
-            d=reg(p[1]); a=reg(p[2])
+        elif op in ('fadd','fmul'):
+            d=reg(p[1]); a=reg(p[2]); mul=int(op=='fmul')
             if p[3].startswith('#'):
-                main+=i_fadd_imm(d,a,float(p[3][1:]))
+                main+=i_falu_imm(d,a,float(p[3][1:]),mul)
             else:
-                main+=i_fadd_reg(d,a,reg(p[3]))
+                main+=i_falu_reg(d,a,reg(p[3]),mul)
             fadd_wrote_result=True
         elif op=='movimm':
             d=reg(p[1]); main+=movimm_bytes(d,float(p[2].lstrip('#')))

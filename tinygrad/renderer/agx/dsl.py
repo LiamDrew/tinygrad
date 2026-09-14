@@ -73,12 +73,14 @@ STORE = Inst("store", bytes.fromhex("e700000000012100"), (
   Field("slot", B(4), 8)),
   doc="buf[slot][thread_index] = src (32-bit)")
 WAIT = Inst("wait", bytes.fromhex("510100404600"), doc="wait for one outstanding load")
-FADD = Inst("fadd", bytes.fromhex("0900000000c0"), (
+FALU = Inst("falu", bytes.fromhex("0900000000c0"), (
   Field("srcb", B(1), 8),           # register operand, or E4M3 immediate when bmode has bit 7
-  Field("mod", B(2), 8),            # FADD_ADD_IMM / FADD_NEG
+  Field("mul", B(2, 0), 1),         # 0 = fadd, 1 = fmul (probes/fmul.metal vs sum3.metal: the only differing bit)
+  Field("mod", B(2, 1), 7),         # FADD_ADD_IMM / FADD_NEG, stored >> 1
   Field("srca", B(3), 8),
   Field("bmode", B(4), 8)),         # 0x80 = srcb is an immediate
-  doc="fadd32: result = srca + srcb (result register is implicit for now)")
+  doc="fadd32/fmul32: result = srca op srcb (result register is implicit for now)")
+FADD = FALU # the assembler's old name
 MOVIMM = Inst("movimm", bytes.fromhex("0c80020000000000"), (
   Field("hi7", B(3, 1), 7),         # fp32 bits[31:25]
   Field("mid21", B(4, 3), 21),      # fp32 bits[20:0]
@@ -90,7 +92,7 @@ STOP = Inst("stop", bytes.fromhex("0e000000"))
 GET_TID = Inst("get_tid", bytes.fromhex("1ca01006"), doc="read thread_position_in_grid (prologue)")
 BARRIER = Inst("barrier", bytes.fromhex("110000901100"), doc="end-of-kernel barrier (epilogue, followed by stop)")
 
-TABLE = (LOAD, STORE, WAIT, FADD, MOVIMM, GET_TID, BARRIER, STOP, NOP)
+TABLE = (LOAD, STORE, WAIT, FALU, MOVIMM, GET_TID, BARRIER, STOP, NOP)
 
 def movimm_fields(f:float) -> dict[str, int]:
   v = struct.unpack("<I", struct.pack("<f", f))[0]
@@ -104,10 +106,10 @@ def fmt(inst:Inst, d:dict[str, int]) -> str:
   if inst is STORE:
     src = "result" if d["src"] == STORE_RESULT else f"r{0 if d['src'] == 0x56 else (d['src'] - STORE_RESULT) // 2}"
     return f"store {src}, {d['slot']}"
-  if inst is FADD:
-    a = f"r{operand_reg(d['srca'])}"
-    if d["bmode"] & 0x80: return f"fadd {a}, #{'-' if d['mod'] == FADD_NEG else ''}{e4m3_value(d['srcb']):g}"
-    return f"fadd {a}, r{operand_reg(d['srcb'])}"
+  if inst is FALU:
+    op, a, mod = "fmul" if d["mul"] else "fadd", f"r{operand_reg(d['srca'])}", d["mod"] << 1
+    if d["bmode"] & 0x80: return f"{op} {a}, #{'-' if mod == FADD_NEG else ''}{e4m3_value(d['srcb']):g}"
+    return f"{op} {a}, r{operand_reg(d['srcb'])}"
   if inst is MOVIMM: return f"movimm r{d['dst']}, #{movimm_value(d):g}"
   return inst.mnemonic
 
