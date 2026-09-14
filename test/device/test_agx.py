@@ -74,6 +74,14 @@ class TestAGX(unittest.TestCase):
     self.assertEqual(self.run_asm8(".buffers 3\naddr r0, 2, #0\nload r0, 1, r0\nwait\nstore r0, 0\n", a, a), a[0:32:4])
     self.assertEqual(self.run_asm8(".buffers 3\naddr r0, 3, #1\nload r0, 1, r0\nwait\nstore r0, 0\n", a, a), a[1:64:8])
 
+  def test_addr_multiply(self): # imul, shift-add with a register, and their composition (row * stride + col)
+    a = [float(i) for i in range(1024)]
+    self.assertEqual(self.run_asm8(".buffers 3\nimul r4, #7\nload r0, 1, r4\nwait\nstore r0, 0\n", a, a), a[0:56:7])
+    self.assertEqual(self.run_asm8(".buffers 3\nimul r4, #100\nload r0, 1, r4\nwait\nstore r0, 0\n", a, a), a[0:800:100])
+    self.assertEqual(self.run_asm8(".buffers 3\naddr r4, 1, r1\nload r0, 1, r4\nwait\nstore r0, 0\n", a, a), a[0:24:3])   # (t<<1) + t
+    self.assertEqual(self.run_asm8(".buffers 3\naddr r4, 4, #0\nload r0, 1, r4\nwait\nstore r0, 0\n", a, a), a[0:128:16]) # shift 4
+    self.assertEqual(self.run_asm8(".buffers 3\nimul r4, #5\naddr r6, 1, r4\nload r0, 1, r6\nwait\nstore r0, 0\n", a, a), a[0:56:7]) # 2t + 5t
+
   def test_addr_register(self): # the offset can live in another register (probe with r0 busy: 9f ... 04 / load byte5 82)
     a = [float(i) for i in range(16)]
     self.assertEqual(self.run_asm8(".buffers 3\naddr r2, 0, #1\nload r0, 1, r2\nwait\nstore r0, 0\n", a, a), a[1:9])

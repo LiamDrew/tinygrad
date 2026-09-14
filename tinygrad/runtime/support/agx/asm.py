@@ -9,7 +9,11 @@ def reg(tok):
     assert tok[0]=='r'; return int(tok[1:])
 def i_load(dstreg, slot, first, more_follow): return dsl.LOAD.encode(first=int(first), more=int(more_follow), dst=dstreg, slot=slot)
 def i_load_idx(dstreg, slot, areg, first, more_follow): return dsl.LOAD_IDX.encode(first=int(first), more=int(more_follow), dst=dstreg, slot=slot, areg=areg)
-def i_addr(dst, shift, imm): return dsl.ADDR.encode(dst=dst, imm=imm, shift0=shift & 1, shift1=shift >> 1, noshift=int(shift == 0))
+def i_addr(dst, shift, imm=None, breg=None): # rD = (r1 << shift) + imm, or + rB
+    assert 0 <= shift <= 4
+    b = (breg << 2 | 1) if breg is not None else imm << 1
+    return dsl.ADDR.encode(dst=dst, b=b, breg=int(breg is not None), shift0=shift & 1, shift1=(shift >> 1) & 1, noshift=int(shift == 0))
+def i_imul(dst, stride): return dsl.IMUL.encode(dst=dst, stride=stride)
 def i_wait(): return dsl.WAIT.encode()
 def i_falu_imm(dst,a,imm,mul=0,wait=True): # an immediate needs the six-byte form (byte4 bit7); tail c0 only when waiting for loads
     b,neg=dsl.e4m3(imm)
@@ -44,8 +48,11 @@ def assemble_text(program):
             if len(p)>3: main+=i_load_idx(d,slot,reg(p[3]), load_i==0, load_i<total_loads-1)
             else: main+=i_load(d,slot, load_i==0, load_i<total_loads-1)
             load_i+=1; seen_mem=True; pending=True
-        elif op=='addr':                                 # addr rD, shift, #imm : rD = (t << shift) + imm
-            main+=i_addr(reg(p[1]), int(p[2]), int(p[3].lstrip('#')))
+        elif op=='addr':                                 # addr rD, shift, #imm | rB : rD = (t << shift) + imm | rB   (t is in r1)
+            if p[3].startswith('#'): main+=i_addr(reg(p[1]), int(p[2]), imm=int(p[3][1:]))
+            else: main+=i_addr(reg(p[1]), int(p[2]), breg=reg(p[3]))
+        elif op=='imul':                                 # imul rD, #stride : rD = t * stride
+            main+=i_imul(reg(p[1]), int(p[2].lstrip('#')))
         elif op=='wait':
             main+=i_wait()
         elif op in ('fadd','fmul'):
